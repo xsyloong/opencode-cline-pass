@@ -1,0 +1,39 @@
+{
+  "displayName": "Cline Pass",
+  "baseURL": "https://api.cline.bot/api/v1",
+  "apiKeyEnv": "CLINE_PASS_API_KEY",
+  "accountMode": "roundrobin",
+  "accounts": {
+    "main": {
+      "displayName": "Main",
+      "apiKeyEnv": "CLINE_PASS_MAIN_KEY",
+      "enabled": true,
+      "baseURL": ""
+    },
+    "backup": {
+      "displayName": "Backup",
+      "apiKeyEnv": "CLINE_PASS_BACKUP_KEY",
+      "enabled": true,
+      "baseURL": ""
+    }
+  },
+  "hiddenModels": ["cline-pass/kimi-k3"],
+  "perModel": {
+    "cline-pass/glm-5.2": {
+      "upstreams": ["alibaba", "baseten"],
+      "exclude": ["deepseek"],
+      "pinMode": "preferred",
+      "sort": "ttft"
+    }
+  },
+  "maxConcurrentRequests": 16,
+  "streamIdleTimeoutMs": 300000,
+  "exposeTools": true,
+  "exposeCatalog": false,
+  "skipCatalogScan": false,
+  "historyLimit": 100,
+  "pinSpelling": "both",
+  "serverHost": "127.0.0.1",
+  "serverPort": 0,
+  "dashboard": true
+}

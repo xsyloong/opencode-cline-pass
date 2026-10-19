@@ -1,0 +1,55 @@
+{
+  "name": "opencode-cline-pass",
+  "version": "1.0.0",
+  "description": "Cline Pass provider + account pool + upstream pinning for opencode, implemented as a self-contained plugin with an embedded OpenAI-compatible gateway.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json",
+    "./server": "./server.js"
+  },
+  "files": [
+    "dist",
+    "server.js",
+    "docs",
+    "examples",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "cline-pass",
+    "cline",
+    "llm-provider",
+    "openai-compatible",
+    "openrouter",
+    "vercel-ai-gateway"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.19.3",
+    "zod": "^4.1.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.8.2",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=20.3.0"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // v2 uses the plural key and a model object.
+  "plugins": ["opencode-cline-pass"],
+  "model": { "providerID": "cline-pass", "model": "glm-5.2" }
+}

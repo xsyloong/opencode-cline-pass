@@ -1,0 +1,19 @@
+opencode-cline-pass
+===================
+
+This project is an independent opencode implementation of the behavior
+specified by dsh-cline-pass:
+
+  https://github.com/yhshzh/dsh-cline-pass
+  Copyright (c) dsh-cline-pass contributors
+  Licensed under the MIT License.
+
+The routing, account-pool, probing, pinning, and failover semantics — and
+some user-facing wording — are ported from that project's public source and
+documentation. dsh-cline-pass in turn credits cline-pass-switcher:
+
+  https://github.com/munmunjaklin458-afk/cline-pass-switcher
+  Licensed under the MIT License.
+
+This project is not affiliated with Cline. "Cline" and "Cline Pass" are
+trademarks of their respective owners.

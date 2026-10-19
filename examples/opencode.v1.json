@@ -1,0 +1,5 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-cline-pass"],
+  "model": "cline-pass/glm-5.2"
+}
