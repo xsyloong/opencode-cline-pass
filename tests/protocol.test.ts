@@ -7,12 +7,15 @@ import {
   extractAvailableProviders,
   injectPrefs,
   isAdherenceOk,
+  isKnownCapability,
   mergeUpstreams,
+  normalizeCapabilities,
   normalizePinMode,
   parseRouting,
   parseTier0,
   pinAdherence,
   pinWarnings,
+  routeLocked,
   reasoningOf,
 } from "../src/protocol.js"
 import { streamErrorCode } from "../src/stream.js"
@@ -100,6 +103,90 @@ describe("pin injection", () => {
     expect(none.provider).toBeUndefined()
     expect(injectPrefs({ model: "m" }, {}, { upstream: null, sort: "", excludeList: [] })).toEqual({ model: "m" })
   })
+
+  it("writes the capability gate beside every planner allow-list", () => {
+    // The gate is what makes `only` reach the router on a VMC-fixed id: without
+    // it the planner routes to the private channel and drops the pin silently.
+    const strict = injectPrefs(
+      { model: "m" },
+      { pipeline: "planner" },
+      { upstream: "deepseek", strict: true, capabilities: ["vision", "implicit-caching"] },
+    )
+    expect(strict.providerOptions.gateway.only).toEqual(["deepseek"])
+    expect(strict.providerOptions.gateway.has).toEqual(["vision", "implicit-caching"])
+
+    const preferred = injectPrefs(
+      { model: "m" },
+      { pipeline: "planner" },
+      { upstream: "a", orderRest: ["b"], strict: false, capabilities: ["Tool-Use", "vision", "vision"] },
+    )
+    expect(preferred.providerOptions.gateway.only).toEqual(["a", "b"])
+    expect(preferred.providerOptions.gateway.has).toEqual(["tool-use", "vision"])
+
+    const excluded = injectPrefs(
+      { model: "m" },
+      { pipeline: "planner", upstreams: ["a", "b"] },
+      { upstream: null, excludeList: ["b"], strict: true, capabilities: ["vision"] },
+    )
+    expect(excluded.providerOptions.gateway.only).toEqual(["a"])
+    expect(excluded.providerOptions.gateway.has).toEqual(["vision"])
+  })
+
+  it("omits the gate when it is empty and never writes it alone", () => {
+    const off = injectPrefs(
+      { model: "m" },
+      { pipeline: "planner" },
+      { upstream: "deepseek", strict: true, capabilities: [] },
+    )
+    expect(off.providerOptions.gateway.has).toBeUndefined()
+
+    // Sort alone is not a pin, so no gate: `has` on its own changes the route.
+    const sortOnly = injectPrefs({ model: "m" }, {}, { upstream: null, sort: "cost", capabilities: ["vision"] })
+    expect(sortOnly.providerOptions.gateway.has).toBeUndefined()
+
+    // A detected direct route carries no planner spelling at all.
+    const direct = injectPrefs(
+      { model: "m" },
+      { pipeline: "direct" },
+      { upstream: "a", strict: true, spelling: "detected", capabilities: ["vision"] },
+    )
+    expect(direct.providerOptions).toBeUndefined()
+  })
+
+  it("keeps an unpinnable private channel out of a derived allow-list", () => {
+    // The VMC's private channel serves the probe, so it heads the discovered
+    // list, but the gate cannot select it. An exclusion-derived allow-list must
+    // not inherit it, or an exclusion turns into a 400 for a channel nobody named.
+    const meta = {
+      pipeline: "planner" as const,
+      capabilityGated: true,
+      upstreams: ["openai-compatible-private", "alibaba", "baseten"],
+      channels: { planner: ["openai-compatible-private", "alibaba", "baseten"] },
+      availableProviders: ["alibaba", "baseten"],
+    }
+    const derived = injectPrefs(
+      { model: "m" },
+      meta,
+      { upstream: null, excludeList: ["deepseek"], strict: true, capabilities: ["vision"] },
+    )
+    expect(derived.providerOptions.gateway.only).toEqual(["alibaba", "baseten"])
+
+    // An explicit pin is left untouched: the gateway's 400 is the honest answer.
+    const explicit = injectPrefs(
+      { model: "m" },
+      meta,
+      { upstream: "openai-compatible-private", strict: true, capabilities: ["vision"] },
+    )
+    expect(explicit.providerOptions.gateway.only).toEqual(["openai-compatible-private"])
+
+    // Without the gate nothing is filtered: the old list is still the old list.
+    const ungated = injectPrefs(
+      { model: "m" },
+      { ...meta, capabilityGated: false },
+      { upstream: null, excludeList: ["deepseek"], strict: true, capabilities: [] },
+    )
+    expect(ungated.providerOptions.gateway.only).toEqual(["openai-compatible-private", "alibaba", "baseten"])
+  })
 })
 
 describe("candidate expansion", () => {
@@ -114,10 +201,38 @@ describe("candidate expansion", () => {
       { strict: true, sort: null, excludeList: [], upstream: "a", orderRest: [] },
       { strict: true, sort: null, excludeList: [], upstream: "b", orderRest: [] },
     ])
+    // `preferred` cannot be expressed as an order on the planner pipeline, so it
+    // becomes one attempt over the whole candidate set plus one unpinned
+    // fallback: the set is what the router honors, and the last attempt keeps
+    // "preferred" permissive when the whole set refuses.
     expect(buildAttempts({ upstreams: ["a", "b"], pinMode: "preferred" })).toEqual([
       { strict: false, sort: null, excludeList: [], upstream: "a", orderRest: ["b"] },
-      { strict: false, sort: null, excludeList: [], upstream: "b", orderRest: ["a"] },
+      { strict: false, sort: null, excludeList: [], upstream: null, orderRest: [] },
     ])
+  })
+
+  it("compiles a preferred pin into an allow-list, not just a wish", () => {
+    const meta = { upstreams: ["a", "b", "c"], pipeline: "planner" as const }
+    const pinned = injectPrefs(
+      { model: "m" },
+      meta,
+      { upstream: "a", orderRest: ["b"], strict: false, excludeList: [] },
+    )
+    // `order` alone was silently equivalent to no pin at all.
+    expect(pinned.providerOptions.gateway.order).toEqual(["a", "b"])
+    expect(pinned.providerOptions.gateway.only).toEqual(["a", "b"])
+    expect(pinned.provider.only).toEqual(["a", "b"])
+
+    // A single candidate is still a hard set: "prefer" with nothing to fall
+    // back to means exactly that one channel.
+    const single = injectPrefs({ model: "m" }, meta, { upstream: "c", orderRest: [], strict: false, excludeList: [] })
+    expect(single.providerOptions.gateway.only).toEqual(["c"])
+
+    // The trailing unpinned attempt writes no channel preference at all.
+    const auto = injectPrefs({ model: "m" }, meta, { upstream: null, orderRest: [], strict: false, excludeList: [] })
+    expect(auto.providerOptions?.gateway?.only).toBeUndefined()
+    expect(auto.providerOptions?.gateway?.order).toBeUndefined()
+    expect(auto.provider?.only).toBeUndefined()
   })
 
   it("normalizes pin modes", () => {
@@ -131,6 +246,16 @@ describe("candidate expansion", () => {
 
   it("drops excluded channels from the chain", () => {
     expect(buildAttempts({ upstreams: ["a", "b"], exclude: ["b"] }).map((a) => a.upstream)).toEqual(["a"])
+  })
+
+  it("carries the capability gate on every attempt", () => {
+    const attempts = buildAttempts({ upstreams: ["a", "b"], capabilities: ["vision", "vision", " Tool-Use "] })
+    expect(attempts[0]!.capabilities).toEqual(["vision", "tool-use"])
+    expect(attempts[1]!.capabilities).toEqual(["vision", "tool-use"])
+    // An empty gate is omitted rather than written as `has: []`, which the
+    // planner ignores anyway and which would hide that pinning is off.
+    expect(buildAttempts({ upstreams: ["a"], capabilities: [] })[0]!.capabilities).toBeUndefined()
+    expect(buildAttempts({ upstreams: ["a"] })[0]!.capabilities).toBeUndefined()
   })
 })
 
@@ -166,6 +291,16 @@ describe("warnings and discovery", () => {
     )
     expect(pinWarnings({ upstream: null, excludeList: ["b"] }, { upstreams: ["a", "b"] })).toEqual([])
     expect(pinWarnings({ upstream: "a", excludeList: ["a"] }, { upstreams: ["a"] })).toEqual([])
+  })
+
+  it("warns when a planner pin has no capability gate", () => {
+    // Without the gate a VMC id silently drops `only`, so this is the one
+    // misconfiguration that produces a clean 200 with the wrong channel.
+    const planner = { upstreams: ["a"], pipeline: "planner" as const }
+    expect(pinWarnings({ upstream: "a" }, planner)[0]).toMatch(/PIN_GATE_MISSING/)
+    expect(pinWarnings({ upstream: "a", capabilities: ["vision"] }, planner)).toEqual([])
+    // A direct route never reads providerOptions, so the gate is not demanded.
+    expect(pinWarnings({ upstream: "a" }, { upstreams: ["a"], pipeline: "direct" as const })).toEqual([])
   })
 
   it("merges, de-duplicates and keeps wide pools", () => {
@@ -223,6 +358,29 @@ describe("warnings and discovery", () => {
     expect(classifyUpstreamError("no available providers")).toBe("bad")
     expect(classifyUpstreamError("invalid api key")).toBe("auth")
     expect(classifyUpstreamError("mystery")).toBe("unknown")
+    // A capability refusal is the channel's own verdict, not a transient fault.
+    expect(
+      classifyUpstreamError(
+        '{"error":{"message":"None of the providers considered for deepseek/deepseek-v4.1-flash-1017 satisfy the required has conditions: quantization:fp8.","type":"no_capable_providers_available"}}',
+      ),
+    ).toBe("bad")
+    expect(
+      classifyUpstreamError("has entries must be one of free, implicit-caching, reasoning"),
+    ).toBe("bad")
+  })
+
+  it("normalizes the capability gate without silently weakening it", () => {
+    expect(normalizeCapabilities([" Vision ", "vision", "tool-use"])).toEqual(["vision", "tool-use"])
+    expect(normalizeCapabilities(undefined)).toEqual([])
+    expect(normalizeCapabilities([], ["vision"])).toEqual([])
+    expect(normalizeCapabilities(undefined, ["vision"])).toEqual(["vision"])
+    // Unknown values are kept: the planner's 400 names the whole vocabulary.
+    expect(normalizeCapabilities(["visoin"])).toEqual(["visoin"])
+    expect(isKnownCapability("vision")).toBe(true)
+    expect(isKnownCapability("quantization")).toBe(false)
+    expect(isKnownCapability("quantization:fp8")).toBe(true)
+    expect(isKnownCapability("!quantization:bf16")).toBe(true)
+    expect(isKnownCapability("vision ")).toBe(true)
   })
 })
 
@@ -278,5 +436,39 @@ describe("model ids", () => {
     expect(wireModelId("glm-5.2")).toBe("cline-pass/glm-5.2")
     expect(wireModelId("cline-pass/glm-5.2")).toBe("cline-pass/glm-5.2")
     expect(wireModelId("")).toBe("")
+  })
+
+  it("lets an alias override both the bare key and the prefixed id", () => {
+    const aliases = { "cline-pass/deepseek-v4.1-flash-1017-open": "deepseek/deepseek-v4.1-flash-1017" }
+    expect(wireModelId("deepseek-v4.1-flash-1017-open", aliases)).toBe("deepseek/deepseek-v4.1-flash-1017")
+    expect(wireModelId("cline-pass/deepseek-v4.1-flash-1017-open", aliases)).toBe(
+      "deepseek/deepseek-v4.1-flash-1017",
+    )
+    // An unaliased id keeps the prefix rule.
+    expect(wireModelId("glm-5.2", aliases)).toBe("cline-pass/glm-5.2")
+  })
+
+  it("reads the VMC off a routed answer and treats it as a locked route", () => {
+    const locked = parseRouting({
+      model: "vmc/deepseek-v4p1-flash-1017-contributor-fallbacks",
+      choices: [
+        {
+          message: {
+            provider_metadata: {
+              gateway: {
+                virtualModelConfig: { modelId: "deepseek-v4p1-flash-1017-contributor-fallbacks" },
+                routing: { finalProvider: "openai-compatible-private", fallbacksAvailable: [] },
+              },
+            },
+          },
+        },
+      ],
+    })
+    expect(locked.virtualModel).toBe("deepseek-v4p1-flash-1017-contributor-fallbacks")
+    expect(routeLocked(locked)).toBe(true)
+    // A VMC that still publishes fallbacks has more than one channel.
+    expect(routeLocked({ ...locked, fallbacks: ["baseten"] })).toBe(false)
+    // No VMC at all means the router was free to choose.
+    expect(routeLocked({ virtualModel: null, fallbacks: [] })).toBe(false)
   })
 })

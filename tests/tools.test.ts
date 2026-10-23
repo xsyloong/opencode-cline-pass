@@ -81,7 +81,22 @@ describe("management tools", () => {
       exclude: ["deepseek"],
       pinMode: "preferred",
       sort: "ttft",
+      capabilities: [],
     })
+  })
+
+  it("stores the capability gate and shows the effective one", async () => {
+    const { tools: registry, runtime } = await tools()
+    const text = await registry.cline_pass_pin.execute(
+      { model: "glm-5.2", upstreams: ["alibaba"], capabilities: ["Vision", "tool-use"] },
+      ctx,
+    )
+    expect(text).toContain("capabilities=vision+tool-use")
+    expect(runtime.control.readConfig().perModel[MODEL]!.capabilities).toEqual(["vision", "tool-use"])
+
+    // The listing reports the effective gate, not just the stored override.
+    const listing = await registry.cline_pass_models.execute({ model: "glm-5.2" }, ctx)
+    expect(listing).toContain("gate=vision+tool-use")
   })
 
   it("hides and shows models through the models tool", async () => {

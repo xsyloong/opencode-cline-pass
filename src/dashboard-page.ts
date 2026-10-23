@@ -208,6 +208,9 @@ export function dashboardHTML(token: string, _options: { dashboardUrl?: string }
   .trace-list { display:flex; flex-direction:column; gap:3px; }
   .trace { display:flex; gap:8px; flex-wrap:wrap; font-size:11.5px; }
   .trace .mono { min-width:80px; }
+  .notice { border-radius:10px; padding:9px 11px; font-size:11.5px; line-height:1.55; border:1px solid var(--line); }
+  .notice.warn { color:var(--warn); border-color:rgba(224,169,46,.35); background:rgba(224,169,46,.07); }
+  .notice code { font-size:11px; }
   .empty { border:1px dashed var(--line); border-radius:10px; padding:18px; text-align:center; color:var(--muted); font-size:12.5px; }
   .empty.small { padding:10px; }
   .loading { display:flex; align-items:center; gap:8px; color:var(--muted); padding:14px; }
@@ -730,11 +733,16 @@ function modelCard(model) {
         '<label class="field">模式<select data-field="pinMode"><option value="strict"' + (model.pinMode === 'strict' ? ' selected' : '') + '>strict</option><option value="preferred"' + (model.pinMode === 'preferred' ? ' selected' : '') + '>preferred</option></select></label>' +
         '<label class="field">排序<select data-field="sort">' + ['','cost','ttft','tps'].map((value) => '<option value="' + value + '"' + ((['cost','ttft','tps'].includes(model.sort) ? model.sort : '') === value ? ' selected' : '') + '>' + (value || 'none') + '</option>').join('') + '</select></label>' +
       '</div>' +
+      (model.pinInert
+        ? '<div class="notice warn">此 id 连「不可能的能力门探测」都照常回答：网关在建连前就丢弃了 <code>providerOptions</code>，pin 无法生效。换一个网关会评估渠道的 model id（如 <code>vendor/model</code> slug）才能钉住。</div>'
+        : (model.capabilityGated
+          ? '<div class="notice">此 id 经 VMC「' + esc(model.virtualModel || '未知') + '」路由：默认只给一条私有渠道。pin 之所以生效，是因为请求同时带了 <code>has</code> 能力门（当前：<b>' + esc((model.capabilities || []).join('+') || '未设置') + '</b>）——它把没有能力元数据的私有渠道排除掉，网关才评估 <code>only</code>。走的仍是订阅系统凭据，不额外扣 credits。</div>'
+          : '')) +
       '<div class="pin-chain" data-role="pin-summary">' + pinChainHTML(pinned, excluded) + '</div>' +
       '<div class="toolbar"><input class="search" data-channel-filter="' + esc(model.id) + '" type="text" placeholder="过滤渠道…" value="' + esc(ui.channelQuery[model.id] || '') + '"><span class="muted">' + channelSummary + '</span></div>' +
       (channels.length ? '<div class="channel-grid">' + channels.map((name) => channelCard(name, verdicts.get(name), pinned, excluded)).join('') + '</div>' : '<div class="empty small">' + (names.length ? '没有匹配的渠道' : '尚未探测到渠道；点上方「探测」') + '</div>') +
       '<div class="muted" style="font-size:11.5px">' + (model.upstreams.length === 0 && names.length ? '探测数据在重启后为空，当前显示已保存的 pin；点「探测」恢复完整列表。' : '未校验不代表不可用；「测试」只发一次请求验证当前 pin。') + '</div>' +
-      '<details class="subdetails"><summary>高级：手动编辑 pin 顺序 / 排除</summary><div class="subdetails-body"><div class="row"><input type="text" size="44" data-field="pinned" value="' + esc(model.pinned.join(',')) + '" placeholder="alibaba,baseten"><input type="text" size="26" data-field="excluded" value="' + esc(model.excluded.join(',')) + '" placeholder="deepseek"><button class="btn mini primary" data-action="pin-save">保存手动编辑</button><span class="muted" data-role="pin-dirty"></span></div></div></details>' +
+      '<details class="subdetails"><summary>高级：手动编辑 pin 顺序 / 排除</summary><div class="subdetails-body"><div class="row"><input type="text" size="44" data-field="pinned" value="' + esc(model.pinned.join(',')) + '" placeholder="alibaba,baseten"><input type="text" size="26" data-field="excluded" value="' + esc(model.excluded.join(',')) + '" placeholder="deepseek"><input type="text" size="22" data-field="capabilities" value="' + esc((model.capabilities || []).join(',')) + '" placeholder="能力门：vision" title="providerOptions.gateway.has：VMC id 上没有它，only 会被丢弃"><button class="btn mini primary" data-action="pin-save">保存手动编辑</button><span class="muted" data-role="pin-dirty"></span></div><div class="muted" style="font-size:11.5px">能力门写进 <code>gateway.has</code>，逗号分隔，如 <code>vision</code>、<code>tool-use</code>、<code>implicit-caching</code>；留空表示关闭能力门（VMC id 上 pin 会失效）。</div></div></details>' +
     '</div>' +
     '<div class="block"><div class="block-head"><b>最近测试</b><span class="muted">验证 pin 是否确实被上游采纳</span></div><div data-role="test-result">' + testResultHTML(model) + '</div></div>' +
     '<div class="block">' + verdictBlockHTML(model) + '</div>' +
@@ -743,7 +751,7 @@ function modelCard(model) {
     '<summary>' +
       '<span class="pin-dot' + (model.pinned.length ? ' on' : '') + '"></span>' +
       '<span class="model-title">' +
-        '<span class="model-title-row"><span class="mono model-id">' + esc(model.id) + '</span><span class="tag">' + esc(model.pipeline || '未探测') + '</span><span class="tag' + (model.pinned.length ? ' brand' : '') + '" data-role="pin-tag">' + pinLabel + '</span><span class="tag' + (model.excluded.length ? ' warn' : '') + '" data-role="exclude-tag"' + (model.excluded.length ? '' : ' style="display:none"') + '>' + excludeLabel + '</span>' + hiddenTag + '</span>' +
+        '<span class="model-title-row"><span class="mono model-id">' + esc(model.id) + '</span>' + (model.wire && model.wire !== model.id ? '<span class="tag" title="实际发往网关的 model id">→ ' + esc(model.wire) + '</span>' : '') + (model.pinInert ? '<span class="tag warn" title="网关在建连前丢弃 providerOptions，pin 不生效">pin 失效</span>' : '') + (model.capabilityGated ? '<span class="tag" title="VMC 固定渠道；pin 靠 has 能力门才到达路由">VMC+门</span>' : '') + '<span class="tag">' + esc(model.pipeline || '未探测') + '</span><span class="tag' + (model.pinned.length ? ' brand' : '') + '" data-role="pin-tag">' + pinLabel + '</span><span class="tag' + (model.excluded.length ? ' warn' : '') + '" data-role="exclude-tag"' + (model.excluded.length ? '' : ' style="display:none"') + '>' + excludeLabel + '</span>' + hiddenTag + '</span>' +
         '<span class="model-sub">' + channelSummary + (model.pinned.length ? ' · ' + esc(model.pinned[0]) + (model.pinMode === 'preferred' ? ' (preferred)' : ' (strict)') : ' · 自动路由') + (model.lastProvider ? ' · last ' + esc(model.lastProvider) + ' ' + model.lastMs + 'ms' : '') + '</span>' +
       '</span>' +
       '<span class="chevron">›</span>' +
@@ -877,13 +885,16 @@ async function savePinFromDom(details, message) {
   const excluded = dedupe(splitList(details.querySelector('[data-field="excluded"]').value)).filter((name) => !pinned.includes(name));
   const pinMode = details.querySelector('[data-field="pinMode"]').value;
   const sort = details.querySelector('[data-field="sort"]').value;
-  const result = await api('model.pin', { model, upstreams: pinned, exclude: excluded, pinMode, sort });
+  const gateField = details.querySelector('[data-field="capabilities"]');
+  const capabilities = gateField ? dedupe(splitList(gateField.value)) : undefined;
+  const result = await api('model.pin', { model, upstreams: pinned, exclude: excluded, pinMode, sort, ...(capabilities === undefined ? {} : { capabilities }) });
   const entry = state.models.find((item) => item.id === model);
   if (entry) {
     entry.pinned = pinned;
     entry.excluded = excluded;
     entry.pinMode = pinMode === 'preferred' ? 'preferred' : 'strict';
     entry.sort = sort;
+    if (capabilities !== undefined) entry.capabilities = capabilities;
   }
   state.pinnedModels = state.models.filter((item) => item.pinned.length > 0).length;
   updatePinUI(details, pinned, excluded);
@@ -1024,7 +1035,12 @@ async function handleModelAction(button, action) {
     await runModelAction(button, details, '探测中', async () => {
       const result = await api('model.probe', { model });
       const found = result.result && result.result.upstreams ? result.result.upstreams.length : 0;
-      toast('探测完成：' + found + ' 个渠道 · pipeline=' + ((result.result && result.result.pipeline) || 'unknown'), 'ok');
+      const warning = (result.result && result.result.warning) || '';
+      if (warning) {
+        toast('这个 id 走 VMC「' + ((result.result && result.result.virtualModel) || '?') + '」，路由在建连前已固定为单一渠道，pin 不生效。请用 modelAliases 把它指向该模型的 vendor/model slug。', 'warn');
+      } else {
+        toast('探测完成：' + found + ' 个渠道 · pipeline=' + ((result.result && result.result.pipeline) || 'unknown'), 'ok');
+      }
       await refreshState();
     });
     return;

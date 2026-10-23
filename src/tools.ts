@@ -6,12 +6,11 @@
  */
 import { tool } from "@opencode-ai/plugin"
 import { accountProfileFor } from "./accounts.js"
-import { wireModelId } from "./catalog.js"
 import type { Control } from "./control.js"
 import { projectModel, firstLine } from "./dashboard.js"
 import type { Engine } from "./engine.js"
 import type { Logger } from "./log.js"
-import { BUILD_TAG, normalizePinMode, pinWarnings } from "./protocol.js"
+import { BUILD_TAG, normalizeCapabilities, normalizePinMode, pinWarnings } from "./protocol.js"
 import type { ObservationStore } from "./store.js"
 import type { AccountProfile, PinProfile } from "./types.js"
 
@@ -47,9 +46,11 @@ export interface ToolsOptions {
 export function createTools(options: ToolsOptions): Record<string, ReturnType<typeof tool>> {
   const { control, engine, store } = options
   const readConfig = () => control.readConfig()
+  /** One model's stored pin, read under the id the gateway actually sees. */
   const pinOf = (model: string): Partial<PinProfile> => {
     const config = readConfig()
-    return Object.hasOwn(config.perModel ?? {}, model) ? config.perModel[model]! : {}
+    const wire = control.wireModel(model)
+    return Object.hasOwn(config.perModel ?? {}, wire) ? config.perModel[wire]! : {}
   }
 
   const statusTool = tool({
@@ -125,7 +126,7 @@ export function createTools(options: ToolsOptions): Record<string, ReturnType<ty
         await control.updateConfig({ hiddenModels: next })
         await control.refreshModels()
       } else if (typeof args.visible === "boolean") {
-        const target = wireModelId(String(args.model ?? "").trim())
+        const target = control.wireModel(String(args.model ?? "").trim())
         if (!(config.knownModels ?? []).map(String).includes(target)) {
           throw new Error(`${JSON.stringify(target)} is not one of this route's subscription models`)
         }
@@ -137,15 +138,24 @@ export function createTools(options: ToolsOptions): Record<string, ReturnType<ty
       const needle = String(args.model ?? "").trim().toLowerCase()
       const models = (config.knownModels ?? [])
         .filter((id) => needle === "" || String(id).toLowerCase().includes(needle))
-        .map((id) => projectModel(id, pinOf(id), store.metaOf(id), hidden.has(String(id))))
+        .map((id) => {
+          const wire = control.wireModel(String(id))
+          return projectModel(id, control.pinFor(id), store.metaOf(wire), hidden.has(String(id)), wire)
+        })
       const blocks = models.map((model) => {
         const rows = [
           `${model.id}  pipeline=${model.pipeline || "unknown"}${
             model.pinnable ? "" : " (not pinnable)"
-          }${model.hidden ? " (hidden from pickers)" : ""}`,
+          }${model.pinInert ? ` (pins inert — the route never reads them)` : ""}${
+            model.capabilityGated ? ` (VMC ${model.virtualModel || "?"} — pins work only through the capability gate)` : ""
+          }${model.wire === model.id ? "" : ` → ${model.wire}`}${
+            model.hidden ? " (hidden from pickers)" : ""
+          }`,
           `  pinned=${model.pinned.length === 0 ? "(auto)" : model.pinned.join(" > ")} mode=${model.pinMode}${
             model.sort === "" ? "" : ` sort=${model.sort}`
-          }${model.excluded.length === 0 ? "" : ` excluded=${model.excluded.join(",")}`}`,
+          }${model.excluded.length === 0 ? "" : ` excluded=${model.excluded.join(",")}`}${
+            model.capabilities.length === 0 ? "" : ` gate=${model.capabilities.join("+")}`
+          }`,
         ]
         if (model.upstreams.length > 0) {
           const verdicts = new Map(model.upstreamStatus.map((entry) => [entry.upstream, entry.status]))
@@ -175,12 +185,17 @@ export function createTools(options: ToolsOptions): Record<string, ReturnType<ty
       model: z.string().describe('Model id, e.g. "cline-pass/glm-5.2".'),
     },
     async execute(args, context) {
-      const model = wireModelId(String(args.model).trim())
+      const model = control.wireModel(String(args.model).trim())
       const result = await engine.probe(model, { signal: context.abort })
       if (result.ok !== true) return `probe ${model} failed: ${line(result.error, 400)}`
       return [
         `probe ${model}: ok in ${result.ms}ms`,
         `pipeline=${result.pipeline} pinnable=${result.pinnable} canonicalSlug=${result.canonicalSlug || "-"} lastProvider=${result.lastProvider || "-"}`,
+        result.virtualModel === "" ? "" : `virtualModel=${result.virtualModel} pinInert=${result.pinInert}`,
+        result.capabilityGated
+          ? "capabilityGated=true — this id is VMC-fixed; the pin reaches the router only because `has` travels with `only`"
+          : "",
+        result.warning === "" ? "" : `WARNING: ${result.warning}`,
         result.upstreams.length === 0
           ? "upstreams: (none discovered)"
           : `upstreams (${result.upstreams.length}): ${result.upstreams.join(", ")}`,
@@ -198,7 +213,7 @@ export function createTools(options: ToolsOptions): Record<string, ReturnType<ty
       model: z.string().describe('Model id, e.g. "cline-pass/glm-5.2".'),
     },
     async execute(args, context) {
-      const model = wireModelId(String(args.model).trim())
+      const model = control.wireModel(String(args.model).trim())
       const meta = store.metaOf(model)
       if (!Array.isArray(meta.upstreams) || meta.upstreams.length === 0) {
         return `validate ${model} failed: no known upstream channels: run cline_pass_probe for this model first`
@@ -227,7 +242,7 @@ export function createTools(options: ToolsOptions): Record<string, ReturnType<ty
       exclude: z.array(z.string()).optional().describe("Upstream channels to exclude for this call only."),
     },
     async execute(args, context) {
-      const model = wireModelId(String(args.model).trim())
+      const model = control.wireModel(String(args.model).trim())
       const result = await engine.test(model, {
         upstreams: Array.isArray(args.upstreams) ? args.upstreams.map(String) : undefined,
         exclude: Array.isArray(args.exclude) ? args.exclude.map(String) : undefined,
@@ -270,16 +285,22 @@ export function createTools(options: ToolsOptions): Record<string, ReturnType<ty
 
   const pinTool = tool({
     description:
-      'Persist one model\'s upstream pin. `upstreams` is the ordered candidate list, primary first (an empty array returns the model to automatic routing); `exclude` lists channels that must never be used, and is compiled into an allow-list on the wire because the gateway ignores an ignore-field; `pinMode` is "strict" or "preferred"; `sort` orders candidates by "cost", "ttft" or "tps" ("none" clears it). Only the fields you supply change. Returns `warnings` when a name cannot be checked or an exclusion cannot be expressed.',
+      'Persist one model\'s upstream pin. `upstreams` is the candidate list, primary first (an empty array returns the model to automatic routing); `exclude` lists channels that must never be used. Both are compiled into an `only` allow-list on the wire, because the gateway drops `order` and `ignore`. `capabilities` is the gate written as `providerOptions.gateway.has` next to that allow-list: on a VMC-fixed id the planner discards `only` unless a positive capability condition is present, so this is what makes the pin real. Allowed values: free, implicit-caching, reasoning, structured-output, tool-use, vision, or a weight condition such as `quantization:fp8` / `!quantization:bf16`; the default is `["vision"]` and an empty array disables the gate. `pinMode: "strict"` allows one channel per attempt and moves to the next only when it fails; `"preferred"` allows the whole candidate set at once and falls back once, unpinned, if the set refuses. `sort` is written as a hint only — the planner pipeline ignores it. Only the fields you supply change. Returns `warnings` when a name cannot be checked or an exclusion cannot be expressed.',
     args: {
       model: z.string().describe('Model id, e.g. "cline-pass/glm-5.2".'),
       upstreams: z.array(z.string()).optional().describe("Ordered pin list; an empty array clears pinning."),
       exclude: z.array(z.string()).optional().describe("Channels that must never be used."),
       pinMode: z.enum(["strict", "preferred"]).optional().describe("How strictly to honor the pin list."),
       sort: z.enum(["cost", "ttft", "tps", "none"]).optional().describe('Reorder candidates by this metric; "none" clears it.'),
+      capabilities: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Capability gate sent as `providerOptions.gateway.has` (e.g. ["vision"] or ["tool-use"]). An empty array turns the gate off, which makes pins inert on VMC-fixed ids.',
+        ),
     },
     async execute(args) {
-      const model = wireModelId(String(args.model).trim())
+      const model = control.wireModel(String(args.model).trim())
       const config = readConfig()
       const current = pinOf(model)
       const next: PinProfile = {
@@ -287,6 +308,9 @@ export function createTools(options: ToolsOptions): Record<string, ReturnType<ty
         exclude: Array.isArray(args.exclude) ? args.exclude.map(String) : (current.exclude ?? []).map(String),
         pinMode: args.pinMode !== undefined ? args.pinMode : current.pinMode ?? "strict",
         sort: args.sort === undefined ? String(current.sort ?? "") : args.sort === "none" ? "" : String(args.sort),
+        capabilities: Array.isArray(args.capabilities)
+          ? normalizeCapabilities(args.capabilities)
+          : normalizeCapabilities(current.capabilities),
       }
       await control.updateConfig({ perModel: { ...(config.perModel ?? {}), [model]: next } })
       const stored = pinOf(model)
@@ -294,7 +318,13 @@ export function createTools(options: ToolsOptions): Record<string, ReturnType<ty
       const pinned = (stored.upstreams ?? []).map(String)
       const excluded = (stored.exclude ?? []).map(String)
       const known = Array.isArray(meta.upstreams) ? meta.upstreams.map(String) : []
-      const warnings = [...pinWarnings({ upstream: pinned[0] ?? null, excludeList: excluded }, meta)]
+      const gate =
+        Array.isArray(stored.capabilities) && stored.capabilities.length > 0
+          ? normalizeCapabilities(stored.capabilities)
+          : config.pinCapabilities ?? []
+      const warnings = [
+        ...pinWarnings({ upstream: pinned[0] ?? null, excludeList: excluded, capabilities: gate }, meta),
+      ]
       const named = [...pinned, ...excluded]
       if (named.length > 0) {
         if (known.length === 0) {
@@ -319,6 +349,7 @@ export function createTools(options: ToolsOptions): Record<string, ReturnType<ty
         `upstreams: ${pinned.length === 0 ? "(auto)" : pinned.join(" > ")}`,
         `exclude: ${excluded.length === 0 ? "(none)" : excluded.join(", ")}`,
         `pinMode=${normalizePinMode(stored.pinMode)} sort=${stored.sort === "" ? "none" : stored.sort}`,
+        `capabilities=${gate.length === 0 ? "(gate off — pins are inert on VMC ids)" : gate.join("+")}`,
         ...warnings.map((warning) => `⚠ ${warning}`),
         `note: Saved to ${control.configPath}; the next model call uses it. Run cline_pass_test to confirm the gateway honors it.`,
       ].join("\n")

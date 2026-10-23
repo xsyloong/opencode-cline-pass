@@ -158,9 +158,48 @@ sequenceDiagram
 
 **模型来源（按优先级合并）**
 
-1. `knownModels`（配置的订阅模型列表，默认 15 个内置 id）；
+1. `knownModels`（配置的订阅模型列表，默认 19 个内置 id）；
 2. `exposeCatalog: true` 时，追加最近一次官方扫描得到的 id；
 3. 减去 `hiddenModels`（只影响“是否在 picker 中出现”，不删除订阅事实）。
+
+**VMC 路由与能力门 `has`（pin 为何有时生效、有时被丢弃）**
+
+`cline-pass/*` 只是网关侧的一个入口。当它解析到 **VMC（虚拟模型配置）** 时，默认只给一条
+`openai-compatible-private` 渠道；**只写 `only` 时**，`providerOptions.gateway.only/order/sort` 与顶层
+`provider.only` 都会被丢弃，响应里 `fallbacksAvailable: []`、`planningReasoning` 只列一个渠道。
+
+**但加上正面能力条件后，`only` 会被评估**（实测 2026-10，三轮交替 + 11 次真实调用）：
+
+```jsonc
+{"gateway": {"only": ["deepseek"]}}                       // → openai-compatible-private（pin 丢弃）
+{"gateway": {"only": ["deepseek"], "has": ["vision"]}}     // → deepseek（pin 生效）
+```
+
+机制：私有渠道没有能力元数据，正面 `has` 把它排除，网关退回 VMC 的 `originalModelId` 渠道池（18 条系统
+凭据渠道），`providerOptions` 在该池里被评估。`routing.modelAttempts` 记录了 `private/…`(success:false)
+→ `deepseek/…`(credentialType:"system") 的顺序，所以**仍是订阅计费**。
+
+写进请求体的位置（`injectPrefs`）：`only`/`order` 与 `has` 一起写，且 `has` **只在同时写了允许列表时才写**
+（单独写 `has` 会改变默认路由，却不是 pin）。`normalizeCapabilities` 负责去空格、转小写、去重，但**不丢弃
+未知值**——让网关的 400 报出完整合法取值，而不是悄悄削弱 pin。
+
+| 发一条 `only:["__probe__"] + has:[…]` 后的结果 | 判定 |
+| --- | --- |
+| 400 且列出 `Available providers are: …` | 拒绝 → 能钉（`refused`） |
+| 400 `no_capable_providers_available` | 能力门到达了路由，但模型没有该能力（`gated`） |
+| 200 带 `choices`，或 `empty response content` | 推理照跑 → 钉被丢弃（`answered`） |
+| 其他错误 | 无法判断（`unknown`） |
+
+`harvest()` 返回的 `verdict` 就是这张表；`probe` 只采信**探测到的那条管线**的 `verdict`（另一套拼写本来
+就会被该路由忽略，它的答案不构成证据）。planner 的 harvest 默认带能力门（`engine.capabilityGate()`，
+来自 `pinCapabilities` / `perModel[].capabilities`）；`has: []` 等于没有门。
+
+`pinInert` 只由 `answered` 触发；VMC 本身不再代表钉不住。`routeLocked()` 已降级为「VMC 且无 fallback」的
+展示提示，不再参与可钉性判定。
+
+修法：能力门搞定绝大多数 id；确实连门都照常回答的（例如 `deepseek/deepseek-v4.1-flash`）才需要换 id。
+同一模型在开放池另有 `vendor/model` slug，具备完整渠道池但按量计费。`modelAliases` 负责把 picker 里的
+本地 id 映射到该 slug；`perModel` 始终以 **wire id**（别名右侧）为键。
 
 **单模型字段解析（`resolveModelMetadata`）**
 
@@ -371,7 +410,9 @@ block-start(reasoning) → reasoning-delta* → block-start(text) → text-delta
 **pin 注入规则（`injectPrefs`）**
 
 - `strict` 模式：`only = [upstream]`；
-- `preferred` 模式：`order = [upstream, ...其余候选]`，若存在排除则同时给 `only = 允许列表`；
+- `preferred` 模式：`only = [upstream, ...其余候选]`，并同时写 `order = 同一列表`。**只写 `order` 是历史缺陷**：
+  planner 管线会把 `order` 整个丢掉，那种请求看起来有 pin、行为却与自动路由完全一致（实测每种 `order` 排列
+  与不加开关的路由结果一致）。`only` 才是被执行的约束，`order` 只是给“认 order”的路由器的兼容拼写；
 - 没有 upstream 但有排除：把“已知渠道 − 排除”编译成 `only` 允许列表；
 - OpenRouter 额外写 `ignore = 排除列表`：允许列表算不出来（尚无渠道清单）或过期时，排除仍然生效；
 - 排序：`cost→price`、`ttft→latency`、`tps→throughput`（仅 direct 映射，planner 原样）；
@@ -393,13 +434,21 @@ wanted  = listed − exclude（按 normalizeSlug 比较）
 strict  = normalizePinMode(pinMode) === 'strict'
 
 若 wanted 非空：
-  每个 wanted 生成一个候选：
-    upstream = 该渠道
-    orderRest = strict ? [] : 其余 wanted（保持顺序）
-    excludeList = exclude
+  strict：
+    每个 wanted 生成一个候选：
+      upstream = 该渠道
+      orderRest = []
+      excludeList = exclude
+  preferred：
+    候选一：upstream = wanted[0]，orderRest = 其余 wanted
+    候选二：upstream = null，orderRest = []      // 整组都失败后的不钉兜底
 否则：
   单个候选 { upstream: null, orderRest: [], excludeList: exclude }
 ```
+
+`preferred` 之所以只有两个候选：`order` 在 planner 管线上不生效，顺序无法表达，所以“按顺序逐个试”
+只能退化成“整组放行、网关组内自行回退”；保留一个不钉的尾候选，是为了保住 preferred 与 strict 的唯一
+实质差别——strict 全组失败就报错，preferred 还有一次“随便谁服务都行”的机会。
 
 `normalizePinMode`：字符串 trim + 小写后等于 `preferred` 才是 preferred，其余（含 `"strict "`、`STRICT`、空、非法值）一律 strict。**展示的模式与实际执行的模式必须使用同一个归一化函数**。
 
@@ -417,9 +466,18 @@ strict  = normalizePinMode(pinMode) === 'strict'
 
 **配置告警（`pinWarnings`）**
 
+- 路由连「能力门 + 不可能渠道」都照常回答（`pinInert`）→ `PIN_INERT: …`，修复方式是换 model id，不是换 pin；
+- 写了 pin 但能力门为空，且这是 planner / VMC 路由 → `PIN_GATE_MISSING: …`（此时 `only` 会被静默丢弃）；
 - 有排除但还没有渠道清单 → `excludeUnresolved: … run cline_pass_probe`；
 - 所有已知渠道都被排除且无 upstream → `PIN_UNRESOLVED: … falls back to the gateway's own routing`；
 - 排除当前 pinned 渠道本身不告警。
+
+**运行期告警（`server.ts`）**
+
+`pinWarnings` 只能看配置和已探测的元数据，看不到“这一次请求到底被谁服务”。所以请求路径在
+`adherence === 'not-adopted'` 时额外追加一条 `PIN_DROPPED: the gateway ignored this pin and served …`，
+写进请求历史。这是 VMC 之外的第二道探针：即使网关只是静默剥掉了 `providerOptions`、没有留下任何
+VMC 痕迹，也一定会在历史里留下这条警告。
 
 **渠道清单容量**
 
@@ -491,7 +549,8 @@ strict  = normalizePinMode(pinMode) === 'strict'
 2. 失败：保留旧 metadata（尤其 `pipeline`），只记录 `ok:false/lastError/lastMs`；
 3. 成功：`parseRouting` 得到 pipeline、`canonicalSlug`、实际 provider、fallback 列表、planner 决策文本；
 4. **渠道收割（harvest）**：发一个“不可能存在”的 pin（`only:['__probe__']`），让路由在花 token 前失败并报出可用 provider 列表：
-   - planner：解析 `Available providers are: a, b, c`
+   - planner：同时带 `has`（`pinCapabilities` / `perModel[].capabilities`，默认 `['vision']`）。**能力门是 VMC 路由上唯一能让 `only` 被看到的手段**：没有它，私有渠道直接服务、返回 200，什么也收割不到；
+   - planner：解析 `Available providers are: a, b, c`；若返回 `no_capable_providers_available`，判定为 `gated`（pin 到达了路由，但模型不具备该能力）；
    - direct：解析错误 JSON 的 `error.metadata.available_providers`
    - 对当前 pipeline 和另一条 pipeline 各收割一次；
 5. direct 模型（pipeline 非 planner）且有 canonical slug：查 OpenRouter `/models/{slug}/endpoints`，补充每渠道的 `context`、`uptime`、`endpoints` 数量；
@@ -773,8 +832,9 @@ interface Config {
   }>
   accountMode: 'single' | 'roundrobin'   // 默认 "single"
   activeAccount: string            // 默认 ""
-  knownModels: string[]            // 默认 15 个内置 id
+  knownModels: string[]            // 默认 19 个内置 id
   hiddenModels: string[]           // 默认 []
+  modelAliases: Record<string,string> // 本地 id → 实际发往网关的 id，默认 4 个 open-pool 别名（内置项始终与配置合并，同名以配置为准）
   models: Record<string, {         // 每模型覆盖
     name: string                   // 默认 ""
     contextWindow: number          // 默认 0（0 表示未设置）
@@ -854,7 +914,7 @@ sequenceDiagram
   T->>E: probe(model)
   E->>GW: 小请求（256 tokens）
   GW-->>E: choices + routing
-  E->>GW: harvest(planner) only=[__probe__]
+  E->>GW: harvest(planner) only=[__probe__] + has=[vision]
   GW-->>E: Available providers...
   E->>GW: harvest(direct) only=[__probe__]
   GW-->>E: available_providers JSON
@@ -963,7 +1023,7 @@ stateDiagram-v2
 - 流式返回文本；请求体中的 `model` 是完整 wire id `cline-pass/glm-5.2`；
 - 8 个工具全部注册（会话工具列表从 12 增至 20），v1 与 v2 的 `cline_pass_status` 均可执行并返回掩码密钥；
 - `#high` 推理变体最终变成上游 `reasoning_effort: "high"`；
-- 配置了 `perModel` 后，上游请求体同时出现 `provider.order/ignore` 与 `providerOptions.gateway.order/sort`，`sort: cost` 被翻译为网关排序；
+- 配置了 `perModel` 后，上游请求体同时出现 `provider.order/only` 与 `providerOptions.gateway.only + has`；`sort` 只是兼容拼写，planner 管线会忽略它；
 - v2 工具结果必须走 `content`（无 `output` schema 时 `output` 会被拒绝），实现已按此返回。
 
 ### 8.2 实现文件对照

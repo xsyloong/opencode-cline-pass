@@ -3,7 +3,14 @@
  * `cline_pass_*` tools, and the dashboard. One surface keeps the three faces
  * from ever disagreeing about what is configured.
  */
-import { catalogEntry, discoveredContext, providerModelKey, resolveModelMetadata, toOpencodeModelConfig } from "./catalog.js"
+import {
+  catalogEntry,
+  discoveredContext,
+  providerModelKey,
+  resolveModelMetadata,
+  toOpencodeModelConfig,
+  wireModelId,
+} from "./catalog.js"
 import type { ConfigStore } from "./config.js"
 import type { Engine } from "./engine.js"
 import type { Logger } from "./log.js"
@@ -36,8 +43,10 @@ export interface Control {
   setCredential(ref: string, value: string): Promise<void>
   effectiveAccount(): Promise<string>
   usageAccounts(): Promise<UsageAccount[]>
-  refreshCatalog(): Promise<{ added: string[]; models: string[]; sources: string[] }>
+  refreshCatalog(): Promise<{ added: string[]; aliases: string[]; models: string[]; sources: string[] }>
   modelIds(): string[]
+  /** The id the gateway wants for one local model id (honors `modelAliases`). */
+  wireModel(id: string): string
   connection(): Connection
   pinFor(model: string): PluginConfig["perModel"][string] & { spelling: string }
   opencodeModels(): Record<string, Record<string, unknown>>
@@ -71,12 +80,26 @@ export function createControl(options: ControlOptions): Control {
     return ids.filter((id) => !hidden.has(id))
   }
 
+  const wireModel = (id: string): string => wireModelId(id, readConfig().modelAliases ?? {})
+
   const resolveModel = (id: string): ResolvedModel => {
     const cfg = readConfig()
-    const entry = catalogEntry(id) ?? {}
-    const override: Partial<ModelProfile> = Object.hasOwn(cfg.models ?? {}, id) ? cfg.models[id]! : {}
-    const discovered = Object.hasOwn(store.catalog().models ?? {}, id) ? store.catalog().models[id]! : {}
-    const meta = store.metaOf(id)
+    const wire = wireModel(id)
+    // Metadata, discovery and probe results all live under the wire id, so the
+    // alias and the slug it points at never disagree about a context window.
+    // The local id's own entry wins: an alias carries a name worth keeping.
+    const entry = catalogEntry(id) ?? catalogEntry(wire) ?? {}
+    const override: Partial<ModelProfile> = Object.hasOwn(cfg.models ?? {}, id)
+      ? cfg.models[id]!
+      : Object.hasOwn(cfg.models ?? {}, wire)
+        ? cfg.models[wire]!
+        : {}
+    const discovered = Object.hasOwn(store.catalog().models ?? {}, wire)
+      ? store.catalog().models[wire]!
+      : Object.hasOwn(store.catalog().models ?? {}, id)
+        ? store.catalog().models[id]!
+        : {}
+    const meta = store.metaOf(wire)
     const measured = discoveredContext(meta)
     const resolved = resolveModelMetadata(
       cfg.provider,
@@ -136,8 +159,15 @@ export function createControl(options: ControlOptions): Control {
       const scan = await engine.officialModels({})
       const cfg = readConfig()
       const currentModels = (cfg.knownModels ?? []).map(String)
+      // An alias only exists to be selectable, so its local id joins the picker
+      // list alongside whatever the official scan published.
+      const aliasIds = Object.keys(cfg.modelAliases ?? {}).filter((id) => !currentModels.includes(id))
       const added = scan.models.filter((id) => !currentModels.includes(id))
-      if (added.length > 0) await updateConfig({ knownModels: [...currentModels, ...added] })
+      // Alias ids join the picker too, but they are reported separately: they
+      // are configuration this install already carried, not newly published
+      // models, and the two must not look alike in a refresh result.
+      const claimed = [...added, ...aliasIds]
+      if (claimed.length > 0) await updateConfig({ knownModels: [...currentModels, ...claimed] })
       const gatewayIds =
         cfg.exposeCatalog === true ? await engine.gatewayCatalog({}).catch(() => []) : []
       store.setCatalog({
@@ -152,16 +182,27 @@ export function createControl(options: ControlOptions): Control {
           logger.warn("[cline-pass] provider model refresh failed: %s", error instanceof Error ? error.message : String(error))
         }
       }
-      return { added, models: scan.models, sources: scan.sources }
+      return { added, aliases: aliasIds, models: scan.models, sources: scan.sources }
     },
     modelIds,
+    wireModel,
     connection,
     pinFor: (model) => {
       const cfg = readConfig()
-      const stored = Object.hasOwn(cfg.perModel ?? {}, model)
-        ? cfg.perModel[model]!
-        : { upstreams: [], exclude: [], pinMode: "strict", sort: "" }
-      return { ...stored, spelling: cfg.pinSpelling }
+      const wire = wireModelId(model, cfg.modelAliases ?? {})
+      const stored = Object.hasOwn(cfg.perModel ?? {}, wire)
+        ? cfg.perModel[wire]!
+        : Object.hasOwn(cfg.perModel ?? {}, model)
+          ? cfg.perModel[model]!
+          : { upstreams: [], exclude: [], pinMode: "strict", sort: "", capabilities: [] }
+      // A model-level list wins; an empty one inherits the route-wide gate.
+      // Without a gate the planner drops `only` on a VMC-fixed id, so this
+      // fallback is what keeps a plain `perModel.upstreams` pin alive.
+      const capabilities =
+        Array.isArray(stored.capabilities) && stored.capabilities.length > 0
+          ? stored.capabilities
+          : cfg.pinCapabilities ?? []
+      return { ...stored, capabilities: [...capabilities], spelling: cfg.pinSpelling }
     },
     opencodeModels: () => {
       const models: Record<string, Record<string, unknown>> = {}

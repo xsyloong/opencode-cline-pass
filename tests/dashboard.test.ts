@@ -79,7 +79,7 @@ describe("dashboard api", () => {
       effectiveAccount: "a",
       ready: true,
       dashboardUrl: "http://127.0.0.1:9999",
-      build: "opencode-1",
+      build: "opencode-2",
     })
     expect(state.accounts).toHaveLength(2)
     expect(state.models).toHaveLength(1)
@@ -131,6 +131,7 @@ describe("dashboard api", () => {
       exclude: ["c"],
       pinMode: "preferred",
       sort: "cost",
+      capabilities: [],
     })
     const reset: any = await api["model.reset"]({ model: "glm-5.2" })
     expect(reset.model).toBe(MODEL)
@@ -139,6 +140,7 @@ describe("dashboard api", () => {
       exclude: [],
       pinMode: "preferred",
       sort: "",
+      capabilities: [],
     })
   })
 
@@ -211,5 +213,35 @@ describe("dashboard api", () => {
       attempts: ["deepseek"],
     })
     expect(api["nope"]).toBeUndefined()
+  })
+})
+
+describe("aliased models", () => {
+  const LOCAL = "cline-pass/deepseek-v4.1-flash-1017-open"
+  const SLUG = "deepseek/deepseek-v4.1-flash-1017"
+
+  it("projects the local id with the wire slug it actually sends", async () => {
+    const { api, runtime } = await dashboard({
+      knownModels: [LOCAL],
+      modelAliases: { [LOCAL]: SLUG },
+    })
+    const state: any = await api.state()
+    const model = state.models[0]
+    expect(model.id).toBe(LOCAL)
+    expect(model.wire).toBe(SLUG)
+    // The alias keeps its own published name instead of the dated base one.
+    expect(runtime.control.connection().models[0]!.name).toBe("DeepSeek V4.1 Flash 1017 (open pool · billed)")
+  })
+
+  it("stores a pin under the wire id so the router actually sees it", async () => {
+    const { api, runtime } = await dashboard({
+      knownModels: [LOCAL],
+      modelAliases: { [LOCAL]: SLUG },
+    })
+    await api["model.pin"]({ model: LOCAL, upstreams: ["deepinfra"], pinMode: "strict" })
+    expect(runtime.control.readConfig().perModel[SLUG]).toMatchObject({ upstreams: ["deepinfra"] })
+    expect(runtime.control.pinFor(SLUG).upstreams).toEqual(["deepinfra"])
+    // Reading it back through the alias resolves to the same pin.
+    expect(runtime.control.pinFor(LOCAL).upstreams).toEqual(["deepinfra"])
   })
 })

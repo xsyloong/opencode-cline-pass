@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { pinWarnings } from "../src/protocol.js"
 import { bodyOf, makeRuntime, TEST_KEY } from "./helpers.js"
 
 const MODEL = "cline-pass/glm-5.2"
@@ -91,6 +92,177 @@ describe("probe", () => {
     expect(result.ok).toBe(false)
     expect(runtime.store.metaOf(MODEL).pipeline).toBe("planner")
     expect(runtime.store.metaOf(MODEL).upstreams).toEqual(["alibaba"])
+  })
+})
+
+describe("virtual model routes", () => {
+  const VMC = "cline-pass/deepseek-v4.1-flash-1017"
+
+  function vmcFetch(requests: any[]): typeof fetch {
+    return async (url, init) => {
+      const body = bodyOf(init)
+      requests.push({ url: String(url), body })
+      return Response.json({
+        model: "vmc/deepseek-v4p1-flash-1017-contributor-fallbacks",
+        choices: [
+          {
+            message: {
+              content: "OK",
+              provider_metadata: {
+                gateway: {
+                  virtualModelConfig: { modelId: "deepseek-v4p1-flash-1017-contributor-fallbacks" },
+                  routing: {
+                    finalProvider: "openai-compatible-private",
+                    canonicalSlug: "private/deepseek-v4p1-flash-1017-contributor",
+                    fallbacksAvailable: [],
+                    planningReasoning:
+                      "System credentials planned for: openai-compatible-private. Total execution order: openai-compatible-private(system)",
+                  },
+                },
+              },
+            },
+          },
+        ],
+      })
+    }
+  }
+
+  it("treats a VMC route as pinnable once the capability-gated probe reaches the router", async () => {
+    const requests: any[] = []
+    const runtime = await makeRuntime({
+      config: { knownModels: [VMC], accounts, activeAccount: "main" },
+      env,
+      fetchImpl: async (url, init) => {
+        const body = bodyOf(init)
+        requests.push(body)
+        // Only the gated impossible pin is refused. The plain probe (and the
+        // direct spelling) still gets a normal completion, which is exactly what
+        // the VMC path does on the wire.
+        if (
+          body?.providerOptions?.gateway?.only?.[0] === "__probe__" &&
+          Array.isArray(body?.providerOptions?.gateway?.has) &&
+          body.providerOptions.gateway.has.length > 0
+        ) {
+          return Response.json(
+            {
+              error: {
+                message:
+                  "No available providers match the 'only' filter: __probe__. Available providers are: alibaba, baseten, deepseek.",
+              },
+            },
+            { status: 400 },
+          )
+        }
+        return vmcFetch([])(url, init)
+      },
+    })
+    const result = await runtime.engine.probe(VMC)
+    expect(result.ok).toBe(true)
+    expect(result.pipeline).toBe("planner")
+    // The VMC defaults to one private channel, but the gate reaches the router.
+    expect(result.pinnable).toBe(true)
+    expect(result.pinInert).toBe(false)
+    expect(result.capabilityGated).toBe(true)
+    expect(result.virtualModel).toBe("deepseek-v4p1-flash-1017-contributor-fallbacks")
+    expect(result.availableProviders).toEqual(["alibaba", "baseten", "deepseek"])
+    expect(result.upstreams).toContain("alibaba")
+    // The gate rode along on the planner harvest; the direct spelling has none.
+    const gated = requests.filter((body) => body?.providerOptions?.gateway?.only?.[0] === "__probe__")
+    expect(gated).toHaveLength(1)
+    expect(gated[0].providerOptions.gateway.has).toEqual(["vision"])
+    expect(runtime.store.metaOf(VMC).capabilityGated).toBe(true)
+  })
+
+  it("keeps a VMC route inert when even the gated probe is answered", async () => {
+    const requests: any[] = []
+    const runtime = await makeRuntime({
+      config: { knownModels: [VMC], accounts, activeAccount: "main" },
+      env,
+      fetchImpl: vmcFetch(requests),
+    })
+    const result = await runtime.engine.probe(VMC)
+    expect(result.ok).toBe(true)
+    expect(result.pipeline).toBe("planner")
+    // This fake route ignores providerOptions entirely, gate included.
+    expect(result.pinnable).toBe(false)
+    expect(result.pinInert).toBe(true)
+    expect(result.virtualModel).toBe("deepseek-v4p1-flash-1017-contributor-fallbacks")
+    expect(result.upstreams).toEqual(["openai-compatible-private"])
+    expect(result.warning).toMatch(/VMC/)
+    expect(requests.length).toBeGreaterThan(1)
+    expect(runtime.store.metaOf(VMC).pinInert).toBe(true)
+  })
+
+  it("probes without the gate when the gate is switched off", async () => {
+    // An explicit empty `pinCapabilities` is a decision, so the probe must test
+    // the request that will really be sent — not a defaulted one.
+    const requests: any[] = []
+    const runtime = await makeRuntime({
+      config: { knownModels: [VMC], pinCapabilities: [], accounts, activeAccount: "main" },
+      env,
+      fetchImpl: vmcFetch(requests),
+    })
+    const result = await runtime.engine.probe(VMC)
+    expect(result.pinInert).toBe(true)
+    const gated = requests.filter((entry) => entry.body?.providerOptions?.gateway?.only?.[0] === "__probe__")
+    expect(gated).toHaveLength(1)
+    expect(gated[0].body.providerOptions.gateway.has).toBeUndefined()
+  })
+
+  it("treats a route that answers an impossible pin as unpinnable, VMC or not", async () => {
+    // The regression: `deepseek/deepseek-v4.1-flash` returns no
+    // `virtualModelConfig` at all, but silently ignores every `only`. Reading
+    // only the VMC field marked it pinnable and offered a pin that never applied.
+    const SLUG = "deepseek/deepseek-v4.1-flash"
+    const requests: any[] = []
+    const runtime = await makeRuntime({
+      config: { knownModels: [SLUG], accounts, activeAccount: "main" },
+      env,
+      fetchImpl: async (_url, init) => {
+        const body = bodyOf(init)
+        requests.push(body)
+        // An ordinary completion, no matter what `only` was asked for.
+        return Response.json({
+          model: SLUG,
+          choices: [
+            {
+              message: {
+                content: "OK",
+                provider_metadata: {
+                  gateway: {
+                    routing: {
+                      finalProvider: "alibaba",
+                      fallbacksAvailable: ["deepseek", "baseten"],
+                      planningReasoning:
+                        "System credentials planned for: alibaba, deepseek, baseten. Total execution order: alibaba(system) → deepseek(system)",
+                    },
+                  },
+                },
+              },
+            },
+          ],
+        })
+      },
+    })
+    const result = await runtime.engine.probe(SLUG)
+    expect(result.ok).toBe(true)
+    // The impossible `only` was answered instead of refused.
+    expect(requests.some((body) => body?.providerOptions?.gateway?.only?.[0] === "__probe__")).toBe(true)
+    expect(result.pinnable).toBe(false)
+    expect(result.pinInert).toBe(true)
+    expect(result.virtualModel).toBe("")
+    expect(result.warning).toMatch(/impossible pin/)
+  })
+
+  it("warns that a pin is inert instead of silently reporting it unused", async () => {
+    const runtime = await makeRuntime({
+      config: { knownModels: [VMC], accounts, activeAccount: "main" },
+      env,
+      fetchImpl: vmcFetch([]),
+    })
+    runtime.store.learn(VMC, { pipeline: "planner", pinInert: true, virtualModel: "some-vmc" })
+    const warnings = pinWarnings({ upstream: "alibaba" }, runtime.store.metaOf(VMC))
+    expect(warnings[0]).toMatch(/PIN_INERT/)
   })
 })
 
@@ -241,6 +413,7 @@ describe("pin reader", () => {
       pinMode: "preferred",
       sort: "cost",
       spelling: "detected",
+      capabilities: ["vision"],
     })
     expect(runtime.engine.currentPin(MODEL, { upstreams: ["c"] })).toMatchObject({
       upstreams: ["c"],

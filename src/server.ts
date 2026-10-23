@@ -11,7 +11,7 @@ import { randomBytes } from "node:crypto"
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
 import type { AddressInfo } from "node:net"
 import { createDashboardApi, dashboardHTML } from "./dashboard.js"
-import { providerModelKey, wireModelId } from "./catalog.js"
+import { providerModelKey } from "./catalog.js"
 import type { Control } from "./control.js"
 import type { Engine } from "./engine.js"
 import {
@@ -446,15 +446,17 @@ export class ClinePassGateway {
       sendError(res, 400, "the request body is not JSON", INVALID_REQUEST_CODE)
       return
     }
-    const model = wireModelId(String(raw?.model ?? ""))
+    const cfg = this.options.config()
+    // opencode addresses models by their bare key (`glm-5.2`), while the
+    // subscription gateway expects the prefixed wire id (`cline-pass/glm-5.2`).
+    // An alias overrides both: it is how a local id reaches the open-pool slug
+    // when its `cline-pass/*` form resolves to a single-provider VMC.
+    const model = this.options.control.wireModel(String(raw?.model ?? ""))
     if (model.length === 0) {
       sendError(res, 400, "the request names no model", INVALID_REQUEST_CODE)
       return
     }
     const stream = raw.stream === true
-    const cfg = this.options.config()
-    // opencode addresses models by their bare key (`glm-5.2`), while the
-    // subscription gateway expects the prefixed wire id (`cline-pass/glm-5.2`).
     const outbound: Record<string, any> = { ...raw, model }
     if (stream) {
       outbound.stream = true
@@ -528,6 +530,15 @@ export class ClinePassGateway {
         // or learned. Hand it the field it actually reads.
         const adherence = pinAdherence(attempt, { finalProvider: state.observed.provider })
         const warnings = pinWarnings(attempt, meta)
+        if (adherence === "not-adopted") {
+          // A pin the router accepted and then ignored is the failure mode with
+          // no error attached: the answer looks perfect and the channel is not
+          // the one that was asked for. Recording it here is what turns a
+          // silently broken pin into something visible in the request history.
+          warnings.push(
+            `PIN_DROPPED: the gateway ignored this pin and served ${state.observed.provider ?? "(unknown)"}; the model id may now be routed by a VMC, or the pin spelling may have been stripped — run cline_pass_probe for ${model}`,
+          )
+        }
         const elapsed = Date.now() - attemptStarted
         trace.push({
           upstream: attempt.upstream ?? "(auto)",

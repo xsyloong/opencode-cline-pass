@@ -18,11 +18,13 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 模型接入 | 15 个内置订阅模型的目录；可扫描官方清单与 models.dev 采纳新模型 |
+| 模型接入 | 19 个内置 id（含 4 个 open-pool 别名，走按量计费的开放池）；可扫描官方清单与 models.dev 采纳新模型 |
 | 流式 / 工具 / 图片 / 思考 | OpenAI 兼容 SSE 透传；AI SDK 解析文本、`tool_calls`、`reasoning_content`/`reasoning` |
 | 账号池 | 单账号、轮询、启停、增删改、密钥测试；`QUOTA` 冷却 15 分钟，`AUTH` 冷却 30 分钟 |
-| 路由 pin | `strict`/`preferred`；按 `cost`/`ttft`/`tps` 排序；排除编译成允许列表 |
+| 路由 pin | `strict`/`preferred` 都编译成 `only` 允许列表；排除同样编译成允许列表；被丢弃的 pin 记 `PIN_DROPPED` |
+| 能力门 `has` | pin 旁边同时写 `providerOptions.gateway.has`：没有它，VMC 路由会在建连前丢掉 `only`（实测） |
 | 双拼写 | 同时写 `provider.*`（OpenRouter）与 `providerOptions.gateway.*`（Vercel AI Gateway） |
+| 可钉性判定 | 用一次「不可能 `only` + 能力门」实测：路由器拒绝它才算能钉；返回答案说明 pin 在建连前就被丢弃，标 `pinInert` |
 | 探测 / 校验 / 测试 | 探测 pipeline 与渠道；逐渠道真实验证；干跑 pin 并报告实际服务渠道 |
 | 首 token 前故障转移 | 渠道链 + 账号链；一旦交付内容就不再重试 |
 | 并发闸门 | 每账号默认 16 条流；FIFO 等待；abort 立即释放 |
@@ -294,10 +296,153 @@ cline_pass_pin      model=cline-pass/glm-5.2 upstreams=["alibaba","baseten"] pin
 - **探测**：发一条极小请求，识别 `planner`/`direct` 管线，收割可用渠道，并（direct 时）读取 OpenRouter endpoint 详情；
 - **校验**：每个渠道发一条真实小请求，只有“响应报告的服务渠道 == 目标渠道”才算 `available`；
 - **测试**：按当前 pin 跑完整候选链，返回实际服务渠道与 trace，不持久化；
-- **钉住**：`strict` 只允许指定渠道；`preferred` 按顺序尝试并在首个 token 前切换；`sort` 支持 `cost`/`ttft`/`tps`；
+- **钉住**：两种模式都落成 `only` 允许列表——`strict` 每次只允许一个渠道（失败才换下一个），`preferred` 一次允许整组候选（网关在组内自行回退），全部失败后再补一次不钉的兜底；
+- **能力门**：允许列表旁边总带上 `providerOptions.gateway.has`（默认 `["vision"]`）。在 VMC 路由上，没有它 `only` 会在建连前被丢弃——见下一节；
+- **顺序与排序**：`order`/`sort` 在 planner 管线上会被静默丢弃（实测：每种 `order` 排列与不加任何开关的路由结果完全一致），所以它们只是兼容性拼写，真正的约束来自 `only`；
 - **排除**：编译成允许列表；direct 管线额外写 `ignore`；如果响应报告了被排除的渠道，记录为 `adherence=violated`。
 
 > 200 不代表 pin 生效：路由会静默丢弃不可用的 `only`。请以 `cline_pass_test` 报告的 `actual` 渠道为准。
+
+### 让 VMC 路由也能钉：`has` 能力门（实测结论）
+
+这是本插件最重要的一次行为修正。此前文档写着「VMC 路由只能有一个渠道，pin 一定失效」——**只写 `only` 时成立，加上 `has` 后不成立**。
+
+同一账号、同一天、`cline-pass/deepseek-v4.1-flash-1017`（订阅 id，VMC → `openai-compatible-private`）：
+
+```jsonc
+// 只写 only：pin 被静默丢弃，三轮都是私有渠道
+{"providerOptions": {"gateway": {"only": ["deepseek"]}}}
+// → finalProvider=openai-compatible-private, fallbacksAvailable=[], 3/3 轮
+
+// only + has：同样是订阅路由，pin 生效，三轮都是 deepseek
+{"providerOptions": {"gateway": {
+  "only": ["deepseek"],
+  "has": ["vision", "implicit-caching"]
+}}}
+// → finalProvider=deepseek, fallbacksAvailable=[], 3/3 轮
+// → planningReasoning: "Provider set restricted to: deepseek.
+//     System credentials planned for: deepseek. Required capabilities
+//     [vision, implicit-caching]: all 1 attempts match."
+```
+
+**机制**（从响应里的 `routing.modelAttempts` 读出来的）：VMC 默认那条 `openai-compatible-private` 渠道没有能力元数据，所以任何**正面**的 `has` 条件都会把它排除掉；网关随后退回 VMC 的 `originalModelId` 渠道池（该模型有 18 条系统凭据渠道），而在这个池里 `providerOptions` 是被评估的。attempt 记录正是这个顺序：
+
+```json
+[{"canonicalSlug": "private/deepseek-v4p1-flash-1017-contributor", "success": false, "providerAttemptCount": 0},
+ {"canonicalSlug": "deepseek/deepseek-v4.1-flash-1017", "success": true,
+  "providerAttempts": [{"provider": "deepseek", "credentialType": "system", "statusCode": 200}]}]
+```
+
+`credentialType: "system"` 是关键：**仍然是订阅系统凭据，不额外扣 credits**（实测 11 次调用后 Credits 用量未变），只是把「走哪条渠道」的选择权拿了回来。
+
+**怎么证明 pin 真的生效**（也是插件的探测方法）：给一个不存在的渠道名配一个能力门，路由会在花 token 之前报错并列出真实渠道：
+
+```jsonc
+{"providerOptions": {"gateway": {"only": ["__probe__"], "has": ["vision"]}}}
+// 400: No available providers match the 'only' filter: __probe__.
+//      Available providers are: alibaba, baseten, boundless, deepinfra, deepseek,
+//      fireworks, gmicloud, inference-net, morph, novita, parasail, pareto,
+//      particle, relace, runinfra, runware, togetherai, wafer
+```
+
+同一个请求去掉 `has` 会照常返回 200 —— 这就是「pin 在到达路由前被丢弃」的判定依据。
+
+**边界（全部实测）**
+
+| 写法 | 结果 |
+| --- | --- |
+| `has: []` | 等于没有能力门 → 又回到 `openai-compatible-private` |
+| 只写 `has`，不写 `only` | **不是 pin**：18 条渠道，加权随机（实测落到 novita/deepseek） |
+| `has: ["!quantization:bf16"]`（只有否定条件） | 不开门，仍走私有渠道 |
+| `only: ["openai-compatible-private"] + has` | 400：它不在 VMC 的渠道表里（它本来就是默认值，钉它没有意义） |
+| 未知能力值（如 `visoin`） | 400 `invalid_request_error`，并列出合法取值 |
+| 能力无法满足（如 `quantization:fp8`） | 400 `no_capable_providers_available`，错误里点名渠道 |
+| 流式 + 工具调用 + pin | 正常：`finalProvider=baseten`，tool_calls 与 usage 都在 |
+
+合法取值：`free`、`implicit-caching`、`reasoning`、`structured-output`、`tool-use`、`vision`，以及权重格式条件 `quantization:fp8` / `!quantization:bf16` 之类。
+在 `deepseek-v4.1-flash-1017` 上，前五种能力都是「18/18 全部满足」——能力门在这里的作用是**开门**，不是筛渠道；真正逐渠道过滤的是权重格式条件。
+
+### 价格：订阅路由现在既便宜又可钉
+
+| 路由 | 能不能钉 | 实际计费（实测同一天、同一账号） |
+| --- | --- | --- |
+| `cline-pass/deepseek-v4.1-flash-1017`（VMC，`has` + `only`） | ✔ | **$0.012 / 百万 token**（订阅，credits 不变） |
+| `deepseek/deepseek-v4.1-flash-1017`（开放池，`only` 单独就生效） | ✔ | **$0.368 / 百万 token**（按量） |
+
+响应体里的 `usage.cost` 是市场参考价，不是账单；真实扣费看 Cline 用量面板的 Credits Used / 用量接口的 `costUsd`。
+**既然订阅 id 也能钉，就没有理由为了「可钉」切到开放池**——除非你确实需要开放池里的某条渠道（例如特定量化精度或避开某个转售商）。
+
+### 配置示例
+
+```json
+{
+  "pinCapabilities": ["vision"],
+  "perModel": {
+    "cline-pass/deepseek-v4.1-flash-1017": {
+      "upstreams": ["baseten", "deepseek"],
+      "pinMode": "strict",
+      "capabilities": ["vision", "implicit-caching"]
+    }
+  }
+}
+```
+
+- `pinCapabilities` 是全局默认能力门；`perModel[].capabilities` 覆盖它，留空表示继承；
+- 显式写 `"capabilities": []` 表示**关闭**能力门（此时 VMC id 上的 pin 会失效，工具会报 `PIN_GATE_MISSING`）；
+- 纯文本模型（没有 vision）应改用 `["tool-use"]` 或它确实具备的能力，否则网关会回 `no_capable_providers_available`；
+- `perModel` 的键是 **wire id**（别名右侧的 slug），不是 picker 里显示的名字。
+
+### 仍然钉不住的 id：`pinInert`
+
+还有少数 id 连「能力门 + 不可能渠道」都照常回答，说明网关在建连前就把 `providerOptions` 剥掉了（例如 `deepseek/deepseek-v4.1-flash`）。探测会把它们标成 `pinInert=true`，请求里附带 `PIN_INERT` 警告。
+
+这类 id 想钉只能换 model id——同一模型的权重在开放池里另有 slug（`vendor/model`），走完整多渠道路由：
+
+```bash
+# 被网关剥掉 providerOptions，pin 无效
+cline_pass_probe model=deepseek/deepseek-v4.1-flash
+
+# 换 slug 后 pin 可用（按量计费）
+cline_pass_probe model=deepseek/deepseek-v4.1-flash-1017
+```
+
+`modelAliases` 让 picker 里保持一个干净的名字，同时把 slug 发给网关：
+
+```json
+{
+  "knownModels": ["cline-pass/deepseek-v4.1-flash-1017-open"],
+  "modelAliases": {
+    "cline-pass/deepseek-v4.1-flash-1017-open": "deepseek/deepseek-v4.1-flash-1017"
+  },
+  "perModel": {
+    "deepseek/deepseek-v4.1-flash-1017": {
+      "upstreams": ["deepinfra", "relace"],
+      "pinMode": "preferred"
+    }
+  }
+}
+```
+
+三点要记住：
+
+- `perModel` 的键是 **wire id**（别名右侧的 slug），不是 picker 里显示的名字；
+- 内置别名指向开放池，是按量计费的；**能钉的订阅 id 不需要别名**，别为了钉住把账单翻 30 倍；
+- 开放池内部按渠道分别计价，同一模型不同渠道可相差数十倍；但 **`sort: "cost"` 不生效**，想在该池内省钱只能显式钉住便宜渠道（deepinfra 约 0.10 / 0.29 每百万，deepseek 官方 0.30 / 1.20）。
+
+### pin 被静默丢弃时会发生什么
+
+钉住最危险的失败不是报错，而是 **200 + 换了个渠道**。每次真实请求都会把响应自报的渠道和 pin 比对：
+
+| `adherence` | 含义 |
+| --- | --- |
+| `adopted` | 就是你要的渠道 |
+| `fallback` | 落在你给的候选组内，但不是首选 |
+| `not-adopted` | 网关无视了 pin，并记录一条 `PIN_DROPPED` 警告（请求历史里可见） |
+| `violated` | 服务渠道在你明确排除的名单里 |
+
+`PIN_GATE_MISSING` 是另一条：pin 写了、能力门却是空的。此时 VMC 路由会把 `only` 丢掉而不报错，等于白钉。
+
+`PIN_DROPPED` 是 VMC 之外的第二道探针：即使网关只是悄悄剥掉了 `providerOptions`、没有留下任何 VMC 痕迹，这条警告也会出现在历史里。
 
 > 生效时机：账号、pin、并发/超时改动会即时进入下一条请求。opencode v2 下，模型清单、元数据和可见性会尝试通过 `provider.reload()` 即时刷新；如果选择器没有变化，重启 opencode。`exposeTools` 在启动时决定是否注册，改动必须重启；v1 的模型清单/可见性也需要重启。
 
@@ -314,7 +459,7 @@ cline_pass_pin      model=cline-pass/glm-5.2 upstreams=["alibaba","baseten"] pin
 | `cline_pass_probe` | 探测 pipeline 与渠道 |
 | `cline_pass_validate` | 逐渠道真实验证 |
 | `cline_pass_test` | 干跑一个 pin 并报告实际渠道 |
-| `cline_pass_pin` | 保存 pin（候选顺序、排除、模式、排序） |
+| `cline_pass_pin` | 保存 pin（候选顺序、排除、模式、排序、能力门） |
 | `cline_pass_accounts` | 账号池 list/add/remove/mode/set/test |
 | `cline_pass_history` | 内存请求历史 |
 
@@ -355,7 +500,9 @@ cline_pass_pin      model=cline-pass/glm-5.2 upstreams=["alibaba","baseten"] pin
 
 > 端口默认随机（`serverPort: 0`），避免多实例冲突。仪表盘只监听回环地址；`/_api` 需要页面内嵌的进程令牌，`/v1` 需要 Bearer 令牌。
 >
-> 带日期后缀的模型（如 `deepseek-v4.1-flash-1017`）会自动继承基础模型的上下文窗口和模态，不会落回 `defaultContextWindow: 128000`；这能避免长会话被 opencode 过早压缩。如果 Cline 对该快照的实际窗口不同，用 `models.<id>.contextWindow` 显式覆盖。
+> 带日期后缀的模型（如 `deepseek-v4.1-flash-1017`）会自动继承基础模型的上下文窗口和模态，不会落回 `defaultContextWindow: 128000`；这能避免长会话被过早压缩。如果 Cline 对该快照的实际窗口不同，用 `models.<id>.contextWindow` 显式覆盖。
+>
+> 上下文窗口会以两种形状同时发布：opencode 读 `limit.context`，而 dsh 底层的 pi-ai 只读顶层的 `contextWindow`。只写 `limit` 的话，dsh 会把每个模型都解析成路由级的 `defaultContextWindow`（1M 的模型被当成 128k，会话过早压缩）。两种形状写的是同一个值，谁也不会读到过期数字。
 >
 > 多 location / 多 opencode 客户端时，`cline-pass.runtime.json` 只会保留最后启动实例的地址；请以 `/cline-pass` 命令或 `cline_pass_status` 返回的地址为准，它们对应当前 session 的 location。
 
@@ -405,11 +552,13 @@ chmod 755 ~/.config/opencode/cline-pass-open
 | `accounts` | `{}` | 账号池；空表示一个隐式 `default` |
 | `accountMode` | `"single"` | `single` / `roundrobin` |
 | `activeAccount` | `""` | single 模式首选账号 |
-| `knownModels` | 15 个内置 id | 路由广告的订阅模型 |
+| `knownModels` | 19 个内置 id | 路由广告的订阅模型 |
 | `hiddenModels` | `[]` | 从 picker 隐藏（不删除订阅事实） |
+| `modelAliases` | 4 个 open-pool 别名 | 本地 model id → 实际发往网关的 id；用来切到按量计费的开放池。内置项会随版本增补，配置里的同名项优先 |
 | `models` | `{}` | 单模型覆盖：name/contextWindow/maxTokens/reasoning/input |
 | 日期后缀模型 | 自动继承基础模型 | 例如 `deepseek-v4.1-flash-1017` 继承 `deepseek-v4.1-flash` 的 1M 上下文/384k 上限/模态；上游实际不同时用 `models.contextWindow` 覆盖 |
-| `perModel` | `{}` | 单模型 pin：upstreams/exclude/pinMode/sort |
+| `pinCapabilities` | `["vision"]` | 全局能力门，写进 `providerOptions.gateway.has`；`[]` 关闭（VMC id 上的 pin 会失效） |
+| `perModel` | `{}` | 单模型 pin：upstreams/exclude/pinMode/sort/capabilities |
 | `reasoningModels` | `true` | 未知模型是否默认声明 reasoning |
 | `defaultContextWindow` | `128000` | 目录缺失时的上下文窗口 |
 | `defaultMaxTokens` | `64000` | 每次请求的输出预算（会被模型上限与半窗口夹住） |

@@ -60,6 +60,10 @@ describe("plugin wiring", () => {
         attachment: false,
         tool_call: true,
         limit: { context: 1000000, output: 64000 },
+        // pi-ai reads the flat form; publishing only `limit` made dsh fall back
+        // to its 128k route default for a 1M-window model.
+        contextWindow: 1000000,
+        maxTokens: 64000,
         modalities: { input: ["text"], output: ["text"] },
       })
       expect(provider.models["glm-5.2"].reasoning_options[0]).toEqual({

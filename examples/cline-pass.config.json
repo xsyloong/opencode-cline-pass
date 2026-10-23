@@ -17,13 +17,29 @@
       "baseURL": ""
     }
   },
-  "hiddenModels": ["cline-pass/kimi-k3"],
+  "hiddenModels": [
+    "cline-pass/kimi-k3"
+  ],
+  "pinCapabilities": [
+    "vision"
+  ],
+  "modelAliases": {
+    "cline-pass/deepseek-v4.1-flash-1017-open": "deepseek/deepseek-v4.1-flash-1017"
+  },
   "perModel": {
     "cline-pass/glm-5.2": {
-      "upstreams": ["alibaba", "baseten"],
-      "exclude": ["deepseek"],
+      "upstreams": [
+        "alibaba",
+        "baseten"
+      ],
+      "exclude": [
+        "deepseek"
+      ],
       "pinMode": "preferred",
-      "sort": "ttft"
+      "sort": "ttft",
+      "capabilities": [
+        "vision"
+      ]
     }
   },
   "maxConcurrentRequests": 16,

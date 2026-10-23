@@ -31,6 +31,14 @@ export interface PinProfile {
   exclude: string[]
   pinMode: string
   sort: string
+  /**
+   * Capability requirements compiled into `providerOptions.gateway.has`.
+   *
+   * This is not cosmetic. On a VMC-fixed id the planner ignores `only` unless a
+   * positive capability condition travels with it; the gate is what makes the
+   * allow-list reach the router. Empty means "inherit `pinCapabilities`".
+   */
+  capabilities: string[]
 }
 
 /** Validated plugin configuration. */
@@ -44,6 +52,16 @@ export interface PluginConfig {
   activeAccount: string
   knownModels: string[]
   hiddenModels: string[]
+  /**
+   * Local model id to the id the gateway actually wants.
+   *
+   * A `cline-pass/*` id can resolve to a VMC that defaults to one private
+   * channel; its full channel set is reachable through the capability gate, so
+   * an alias is no longer needed to pin it. What an alias still buys is the open
+   * pool (`vendor/model`), a different — per-token billed — route with its own
+   * channel list and pricing.
+   */
+  modelAliases: Record<string, string>
   models: Record<string, ModelProfile>
   perModel: Record<string, PinProfile>
   reasoningModels: boolean
@@ -60,6 +78,14 @@ export interface PluginConfig {
   historyLimit: number
   /** Which pin spellings a request carries. */
   pinSpelling: string
+  /**
+   * Capability requirements sent with every planner pin.
+   *
+   * The planner drops `only` on VMC-fixed ids unless at least one positive
+   * capability condition is present, so this is the switch that makes those pins
+   * real. An empty list disables the gate (and with it, pinning on such ids).
+   */
+  pinCapabilities: string[]
   /** Local gateway bind address. Loopback only by default. */
   serverHost: string
   /** Local gateway port; 0 asks the OS for a free port. */
@@ -109,6 +135,22 @@ export interface ModelMeta {
   ok?: boolean
   pipeline?: "planner" | "direct" | null
   pinnable?: boolean
+  /**
+   * The VMC the gateway routed through, when it used one.
+   *
+   * A virtual model config fixes the provider list before the router ever looks
+   * at a pin, so its presence is the difference between "one channel today" and
+   * "one channel by construction".
+   */
+  virtualModel?: string | null
+  /** True when the route answered an impossible pin: pins cannot apply. */
+  pinInert?: boolean
+  /**
+   * True when the route is a VMC and only a capability-gated pin reaches the
+   * router — i.e. the channel list came from a `has`-qualified probe and a pin
+   * written without `has` would be dropped.
+   */
+  capabilityGated?: boolean
   canonicalSlug?: string | null
   openrouterSlug?: string | null
   upstreams?: string[]
@@ -133,6 +175,8 @@ export interface Attempt {
   orderRest: string[]
   excludeList: string[]
   spelling?: string
+  /** Capability conditions written as `has` next to a planner pin. */
+  capabilities?: string[]
 }
 
 /** A pin configuration as stored (plus the route-wide spelling policy). */
@@ -142,6 +186,7 @@ export interface PinConfig {
   pinMode?: string
   sort?: string | null
   spelling?: string
+  capabilities?: string[]
 }
 
 /** Routing facts read back from one gateway response. */
@@ -155,6 +200,8 @@ export interface Routing {
   finalProviderName: string | null
   fallbacks: string[]
   plan: string
+  /** The VMC that fixed this route, when the gateway used one. */
+  virtualModel: string | null
 }
 
 export type Adherence = "adopted" | "fallback" | "not-adopted" | "violated" | "unresolved"

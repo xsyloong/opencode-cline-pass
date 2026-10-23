@@ -9,7 +9,7 @@
 import type { Adherence, Attempt, ModelMeta, PinConfig, Routing } from "./types.js"
 
 /** Identity of this build, surfaced by status and the startup log. */
-export const BUILD_TAG = "opencode-1"
+export const BUILD_TAG = "opencode-2"
 
 /** How many channels one model's list may hold. */
 export const MAX_UPSTREAMS = 64
@@ -29,6 +29,62 @@ export const OPENROUTER_SORT: Record<string, string> = {
  * can fail a request the right spelling would have served.
  */
 export const CHANNEL_ALIASES: Array<[string, string]> = [["zai", "z-ai"]]
+
+/**
+ * The capability vocabulary the planner accepts in `providerOptions.gateway.has`.
+ *
+ * The list is closed: anything else is refused with HTTP 400 ("has entries must
+ * be one of …"), which is why a configured value is passed through untouched
+ * rather than quietly dropped — a typo should be named by the gateway, not
+ * silently turn the pin off.
+ */
+export const CAPABILITY_VALUES = [
+  "free",
+  "implicit-caching",
+  "reasoning",
+  "structured-output",
+  "tool-use",
+  "vision",
+] as const
+
+/** Weight-format conditions are also accepted: `quantization:fp8`, `!quantization:bf16`. */
+export const WEIGHT_CONDITION = /^!?quantization:[a-z0-9._-]+$/i
+
+/**
+ * The capability gate sent with a pin by default.
+ *
+ * `vision` is supported by every current coding model on this route and, being
+ * a positive condition, is what excludes the VMC's capability-less private
+ * channel so the allow-list is finally evaluated. A text-only model needs
+ * `tool-use` (or another capability it actually has) — see `pinCapabilities`.
+ */
+export const DEFAULT_CAPABILITIES = ["vision"]
+
+/**
+ * Normalize a capability list: trim, lowercase, de-duplicate, keep order.
+ *
+ * Unknown entries are kept. The planner's own 400 names the whole vocabulary,
+ * which is a better diagnostic than a silently weakened pin.
+ */
+export function normalizeCapabilities(value: unknown, fallback: string[] = []): string[] {
+  if (!Array.isArray(value)) return [...fallback]
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const raw of value) {
+    const cap = String(raw ?? "").trim().toLowerCase()
+    if (cap.length === 0 || seen.has(cap)) continue
+    seen.add(cap)
+    out.push(cap)
+  }
+  // An explicit empty list is kept: it is how the gate is switched off.
+  return out
+}
+
+/** Whether one capability entry is in the planner's vocabulary. */
+export function isKnownCapability(value: unknown): boolean {
+  const cap = String(value ?? "").trim().toLowerCase()
+  return (CAPABILITY_VALUES as readonly string[]).includes(cap) || WEIGHT_CONDITION.test(cap)
+}
 
 /** The gateway wraps some answers in a `{ data: … }` envelope; unwrap it. */
 export function unwrapEnvelope<T = any>(json: unknown): T {
@@ -88,6 +144,19 @@ export function parseRouting(json: unknown): Routing {
     {}
   const direct = typeof payload?.provider === "string" ? payload.provider : null
   const finalProvider = routing.finalProvider ?? (direct === null ? null : slugify(direct))
+  // A VMC fixes the provider list before routing happens, so its id is the one
+  // reliable signal that a pin cannot be honored on this route.
+  const virtual =
+    message?.provider_metadata?.gateway?.virtualModelConfig?.modelId ??
+    payload?.provider_metadata?.gateway?.virtualModelConfig?.modelId ??
+    payload?.choices?.[0]?.delta?.provider_metadata?.gateway?.virtualModelConfig?.modelId ??
+    null
+  const virtualModel =
+    typeof virtual === "string" && virtual.length > 0
+      ? virtual
+      : typeof payload?.model === "string" && payload.model.startsWith("vmc/")
+        ? payload.model.slice("vmc/".length)
+        : null
   return {
     content: typeof message?.content === "string" ? message.content : null,
     toolCalls: Array.isArray(message?.tool_calls) ? message.tool_calls : [],
@@ -100,7 +169,22 @@ export function parseRouting(json: unknown): Routing {
     finalProviderName: routing.finalProvider ?? direct,
     fallbacks: Array.isArray(routing.fallbacksAvailable) ? routing.fallbacksAvailable.map(String) : [],
     plan: typeof routing.planningReasoning === "string" ? routing.planningReasoning : "",
+    virtualModel,
   }
+}
+
+/**
+ * Whether the gateway routed through a VMC that offered no fallbacks.
+ *
+ * This describes the *default* route — one private channel — not what a pin can
+ * do. A capability-gated pin (`has` + `only`) still reaches the router on these
+ * ids, so this is a display hint; `pinInert` is the field that says a pin is
+ * actually dropped.
+ */
+export function routeLocked(routing: Partial<Routing> | undefined): boolean {
+  const virtual = routing?.virtualModel ?? null
+  if (virtual === null || virtual.length === 0) return false
+  return (routing?.fallbacks ?? []).length === 0
 }
 
 /**
@@ -162,6 +246,19 @@ export function knownChannels(meta: ModelMeta | undefined, pipeline: "planner" |
  * the exclude/ignore fields. Both spellings are written by default: a pin is
  * honored only by the pipeline that owns the spelling, and the pipeline is
  * decided by the gateway and can differ between calls.
+ *
+ * A `preferred` attempt also carries `only`: the planner pipeline drops `order`
+ * entirely, so writing only `order` produced a request that looked pinned and
+ * behaved exactly like automatic routing. `order` is still written — it is the
+ * cheaper spelling on routers that honor it — but the allow-list is what makes
+ * the pin real.
+ *
+ * `has` travels with every planner allow-list. A VMC-fixed id exposes one
+ * capability-less private channel, and the planner only evaluates `only` once a
+ * positive capability condition has excluded that channel; without the gate the
+ * allow-list is dropped and the pin silently does nothing (verified three
+ * rounds alternating on/off, 2026-10). The condition is deliberately mild
+ * (`vision` by default) — its job is to open the gate, not to narrow the pool.
  */
 export function injectPrefs(
   body: Record<string, any>,
@@ -174,13 +271,28 @@ export function injectPrefs(
   const excludeList = attempt?.excludeList ?? []
   const strict = attempt?.strict !== false
   const sort = normalizeSort(attempt?.sort)
+  const capabilities = normalizeCapabilities(attempt?.capabilities)
   const excluded = excludeList.filter((name) => normalizeSlug(name) !== normalizeSlug(upstream ?? ""))
   const excludedIds = new Set(excluded.map(normalizeSlug))
   const spell = (names: string[], pipeline: "planner" | "direct") =>
     names.map((name) => channelNameFor(name, pipeline))
+  // The candidate set one non-strict attempt is allowed to use. `buildAttempts`
+  // already dropped excluded names from it, so it never needs re-filtering.
+  const candidates = upstream === null ? [] : [upstream, ...orderRest]
+  // A capability-gated harvest publishes the exact set the gate can choose from.
+  // The VMC's private channel is not in it, yet it is the channel that served
+  // the probe, so it heads the discovered list. Leaving it in a *derived*
+  // allow-list would turn an exclusion into a 400 for a channel the caller never
+  // named. Explicitly pinned channels are left alone: a 400 there is the honest
+  // answer, and pinning the private channel is a no-op anyway.
+  const gatedSet =
+    capabilities.length > 0 && meta?.capabilityGated === true && Array.isArray(meta.availableProviders) && meta.availableProviders.length > 0
+      ? new Set(meta.availableProviders.map((name) => normalizeSlug(name)))
+      : null
+  const inGate = (name: string): boolean => gatedSet === null || gatedSet.has(normalizeSlug(name))
   const gatewayAllow =
     excluded.length > 0
-      ? knownChannels(meta, "planner").filter((name) => !excludedIds.has(normalizeSlug(name)))
+      ? knownChannels(meta, "planner").filter((name) => !excludedIds.has(normalizeSlug(name)) && inGate(name))
       : null
   const openRouterAllow =
     excluded.length > 0
@@ -191,7 +303,8 @@ export function injectPrefs(
   const useGateway = both || pipeline === "planner" || pipeline === null
   const useOpenRouter = both || pipeline === "direct" || pipeline === null
   const gatewayUsable =
-    useGateway && (upstream !== null || sort !== null || (gatewayAllow !== null && gatewayAllow.length > 0))
+    useGateway &&
+    (upstream !== null || sort !== null || (gatewayAllow !== null && gatewayAllow.length > 0))
   const openRouterUsable =
     useOpenRouter &&
     (upstream !== null ||
@@ -202,16 +315,23 @@ export function injectPrefs(
 
   if (gatewayUsable) {
     const gateway: Record<string, any> = {}
-    if (upstream !== null) {
+    if (upstream !== null && candidates.length > 0) {
+      const names = spell(candidates, "planner")
       if (strict) gateway.only = spell([upstream], "planner")
       else {
-        gateway.order = spell([upstream, ...orderRest], "planner")
-        if (gatewayAllow !== null && gatewayAllow.length > 0) gateway.only = spell(gatewayAllow, "planner")
+        gateway.order = names
+        gateway.only = names
       }
     } else if (gatewayAllow !== null && gatewayAllow.length > 0) {
       gateway.only = spell(gatewayAllow, "planner")
     }
     if (sort !== null) gateway.sort = sort
+    // The gate goes with an allow-list, never on its own: `has` without `only`
+    // still changes the route (it drops the private channel), which is not what
+    // a caller asked for.
+    if (capabilities.length > 0 && (gateway.only !== undefined || gateway.order !== undefined)) {
+      gateway.has = capabilities
+    }
     next.providerOptions = {
       ...(next.providerOptions ?? {}),
       gateway: { ...(next.providerOptions?.gateway ?? {}), ...gateway },
@@ -220,11 +340,12 @@ export function injectPrefs(
 
   if (openRouterUsable) {
     const provider: Record<string, any> = { ...(next.provider ?? {}) }
-    if (upstream !== null) {
+    if (upstream !== null && candidates.length > 0) {
+      const names = spell(candidates, "direct")
       if (strict) provider.only = spell([upstream], "direct")
       else {
-        provider.order = spell([upstream, ...orderRest], "direct")
-        if (openRouterAllow !== null && openRouterAllow.length > 0) provider.only = spell(openRouterAllow, "direct")
+        provider.order = names
+        provider.only = names
       }
     } else if (openRouterAllow !== null && openRouterAllow.length > 0) {
       provider.only = spell(openRouterAllow, "direct")
@@ -269,33 +390,73 @@ export function isAdherenceOk(adherence: string | undefined): boolean {
  * Name the configuration problems that make a pin impossible to honor.
  */
 export function pinWarnings(attempt: Partial<Attempt> | undefined, meta: ModelMeta | undefined): string[] {
+  const warnings: string[] = []
+  // A locked route is the higher-order problem: it makes every other pin
+  // question moot. The probe decides this with the gate on, so an id that is
+  // merely VMC-routed no longer lands here — only one that answered even a
+  // capability-gated impossible pin does.
+  if (meta?.pinInert === true) {
+    const vmc = typeof meta.virtualModel === "string" && meta.virtualModel.length > 0 ? meta.virtualModel : ""
+    warnings.push(
+      vmc === ""
+        ? "PIN_INERT: this id answered an impossible pin instead of refusing it, so the gateway drops the pin before routing and pins cannot apply. A model id whose routing the gateway exposes (a vendor/model slug) can be pinned, but it bills per token at list price instead of the subscription rate — switch only if you need a specific provider"
+        : `PIN_INERT: this id routes through VMC ${vmc} and still answered a capability-gated impossible pin, so pins cannot reach its router. Pinning needs an id whose provider list the gateway exposes`,
+    )
+  } else {
+    const capabilities = normalizeCapabilities(attempt?.capabilities)
+    const pinned = attempt?.upstream !== null && attempt?.upstream !== undefined
+    // Only the planner path needs the gate. A confirmed direct route ignores
+    // `providerOptions` entirely, so demanding one there would be noise.
+    const plannerPath = meta?.pipeline === "planner" || (meta?.pipeline === undefined && Boolean(meta?.virtualModel))
+    if (pinned && capabilities.length === 0 && plannerPath) {
+      warnings.push(
+        "PIN_GATE_MISSING: the planner drops `only` on a VMC-fixed id unless a positive capability condition travels with it (`providerOptions.gateway.has`). `pinCapabilities` is empty, so this pin can be ignored — set it to a capability the model has, e.g. [\"vision\"] or [\"tool-use\"]",
+      )
+    }
+  }
   const upstream = attempt?.upstream ?? null
   const excluded = (attempt?.excludeList ?? []).filter(
     (name) => normalizeSlug(name) !== normalizeSlug(upstream ?? ""),
   )
   const excludedIds = new Set(excluded.map(normalizeSlug))
-  if (excluded.length === 0) return []
+  if (excluded.length === 0) return warnings
   const known = Array.isArray(meta?.upstreams) ? meta.upstreams : []
   if (known.length === 0) {
-    return [
+    warnings.push(
       `excludeUnresolved: this model has no channel list yet, so ${excluded.join(
         ", ",
       )} could not be compiled into an allow-list — run cline_pass_probe for it`,
-    ]
+    )
+    return warnings
   }
   const remaining = known.filter((name) => !excludedIds.has(normalizeSlug(name)))
   if (remaining.length === 0 && upstream === null) {
-    return [
+    warnings.push(
       `PIN_UNRESOLVED: every known channel is excluded (${known.join(
         ", ",
       )}), so the request falls back to the gateway's own routing`,
-    ]
+    )
   }
-  return []
+  return warnings
 }
 
 /**
  * Expand one model's pin configuration into the ordered failover candidates.
+ *
+ * The two modes buy different things, because the wire only honors one of them:
+ *
+ * - `strict` can be expressed exactly — `only: [one channel]` — so it expands
+ *   into one hard attempt per candidate and a failure is reported honestly.
+ * - `preferred` cannot. The planner pipeline drops `order` outright (verified
+ *   against the live gateway: every `order` permutation routes identically), so
+ *   an ordered list would leave the request completely unpinned. It compiles
+ *   into one attempt over the whole candidate *set*, which the router does
+ *   honor and will fail over within, followed by one unpinned attempt that
+ *   keeps the permissive half of "preferred": if the whole set refuses, the
+ *   gateway may still serve the request from anywhere.
+ *
+ * Every attempt carries the capability gate, because a planner allow-list
+ * without `has` is what the VMC path silently discards.
  */
 export function buildAttempts(config: PinConfig | undefined): Attempt[] {
   const listed = (config?.upstreams ?? []).filter((name) => typeof name === "string" && name.length > 0)
@@ -304,18 +465,27 @@ export function buildAttempts(config: PinConfig | undefined): Attempt[] {
   const wanted = listed.filter((name) => !excluded.has(normalizeSlug(name)))
   const strict = normalizePinMode(config?.pinMode) === "strict"
   const sort = normalizeSort(config?.sort)
-  const base: Omit<Attempt, "upstream" | "orderRest"> = { strict, sort, excludeList: exclude }
+  const capabilities = normalizeCapabilities(config?.capabilities)
+  const base: Omit<Attempt, "upstream" | "orderRest"> = {
+    strict,
+    sort,
+    excludeList: exclude,
+    ...(capabilities.length === 0 ? {} : { capabilities }),
+  }
   const attemptBase: Partial<Attempt> = { ...base }
   if (typeof config?.spelling === "string" && config.spelling.length > 0) attemptBase.spelling = config.spelling
+  const spellingOf = (): Partial<Attempt> =>
+    attemptBase.spelling === undefined ? {} : { spelling: attemptBase.spelling }
   if (wanted.length > 0) {
-    return wanted.map((upstream, index) => ({
-      ...base,
-      ...(attemptBase.spelling === undefined ? {} : { spelling: attemptBase.spelling }),
-      upstream,
-      orderRest: strict ? [] : wanted.filter((_, other) => other !== index),
-    }))
+    if (!strict) {
+      return [
+        { ...base, ...spellingOf(), upstream: wanted[0]!, orderRest: wanted.slice(1) },
+        { ...base, ...spellingOf(), upstream: null, orderRest: [] },
+      ]
+    }
+    return wanted.map((upstream) => ({ ...base, ...spellingOf(), upstream, orderRest: [] }))
   }
-  return [{ ...base, ...(attemptBase.spelling === undefined ? {} : { spelling: attemptBase.spelling }), upstream: null, orderRest: [] }]
+  return [{ ...base, ...spellingOf(), upstream: null, orderRest: [] }]
 }
 
 /**
@@ -325,6 +495,10 @@ export function classifyUpstreamError(message: unknown): string {
   const text = String(message ?? "")
   if (/empty response content/i.test(text)) return "ok"
   if (/429|rate-?limited|temporarily rate/i.test(text)) return "limited"
+  // A capability refusal means the channel is real but cannot satisfy the gate
+  // the pin asked for; that is a property of the channel, not a transient fault.
+  if (/no_capable_providers_available|satisfy the required has conditions/i.test(text)) return "bad"
+  if (/has entries must be one of/i.test(text)) return "bad"
   if (/invalid_request|modelid|no allowed providers|no available providers|not found|unsupported/i.test(text)) {
     return "bad"
   }

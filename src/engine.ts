@@ -19,6 +19,7 @@ import {
 import type { Logger } from "./log.js"
 import type { AccountPool } from "./pool.js"
 import {
+  DEFAULT_CAPABILITIES,
   buildAttempts,
   channelNameFor,
   classifyUpstreamError,
@@ -26,10 +27,12 @@ import {
   injectPrefs,
   isAdherenceOk,
   mergeUpstreams,
+  normalizeCapabilities,
   parseRouting,
   parseTier0,
   pinAdherence,
   pinWarnings,
+  routeLocked,
   unwrapEnvelope,
 } from "./protocol.js"
 import type { ObservationStore } from "./store.js"
@@ -79,6 +82,25 @@ export interface ChainOutcome {
   warnings: string[]
 }
 
+/**
+ * What the impossible-`only` request proved about one pipeline.
+ *
+ * `refused` means the router saw the bad channel and named its pool, which also
+ * proves a real pin reaches it. `answered` means inference ran anyway: the id
+ * drops pins before routing, whatever its metadata claims.
+ */
+export interface HarvestResult {
+  channels: string[] | null
+  /**
+   * `refused`: the router named its pool (the pin reached it).
+   * `answered`: inference ran anyway, so the id drops pins before routing.
+   * `gated`: the capability gate itself was refused, which still proves the pin
+   * reaches the router but means the model/route lacks the requested capability.
+   * `unknown`: neither reading could be taken.
+   */
+  verdict: "refused" | "answered" | "gated" | "unknown"
+}
+
 export interface ProbeResult {
   ok: boolean
   ms: number
@@ -86,6 +108,14 @@ export interface ProbeResult {
   error: string
   pipeline: string
   pinnable: boolean
+  /** The VMC that fixed this route, or an empty string when routing was free. */
+  virtualModel: string
+  /** True when the route answered an impossible pin: pins cannot apply. */
+  pinInert: boolean
+  /** True when the route is a VMC that only honors capability-gated pins. */
+  capabilityGated: boolean
+  /** One human sentence about why a pin will not work, when it will not. */
+  warning: string
   canonicalSlug: string
   lastProvider: string
   upstreams: string[]
@@ -118,6 +148,8 @@ export interface TestResult {
   actualName: string
   pipeline: string
   pinnable: boolean
+  virtualModel: string
+  pinInert: boolean
   canonicalSlug: string
   account: string
   content: string
@@ -145,6 +177,8 @@ export class Engine {
   private readonly probeTimeoutMs: number
   private readonly fetchImpl: typeof fetch | undefined
   private pinReader: (model: string) => PinConfig
+  /** Whether a real reader is wired: then an empty gate is a deliberate choice. */
+  private pinReaderWired: boolean
 
   constructor(options: EngineOptions) {
     this.pool = options.pool
@@ -153,12 +187,14 @@ export class Engine {
     this.attemptTimeoutMs = options.attemptTimeoutMs ?? 180000
     this.probeTimeoutMs = options.probeTimeoutMs ?? 60000
     this.fetchImpl = options.fetchImpl
+    this.pinReaderWired = options.pinReader !== undefined
     this.pinReader = options.pinReader ?? (() => ({ upstreams: [], exclude: [], pinMode: "strict", sort: "" }))
   }
 
   /** Replace the function that reads a model's configured pin. */
   setPinReader(reader: (model: string) => PinConfig): void {
     this.pinReader = reader
+    this.pinReaderWired = true
   }
 
   /** The configured pin for one model. */
@@ -169,8 +205,25 @@ export class Engine {
       exclude: Array.isArray(override.exclude) ? override.exclude.map(String) : stored.exclude ?? [],
       pinMode: stored.pinMode,
       sort: stored.sort ?? "",
+      ...(stored.capabilities === undefined ? {} : { capabilities: stored.capabilities }),
       ...(stored.spelling === undefined ? {} : { spelling: stored.spelling }),
     }
+  }
+
+  /**
+   * The capability gate a planner probe should carry.
+   *
+   * The pin reader already resolves per-model overrides and the route-wide
+   * default; a fresh install with no reader falls back to the shipped gate so
+   * the probe still tests what a real request would send.
+   */
+  capabilityGate(model: string): string[] {
+    const configured = normalizeCapabilities(this.pinReader(model)?.capabilities)
+    if (configured.length > 0) return configured
+    // With a wired reader an empty list is a decision (the gate is off), and the
+    // probe must test that same request: defaulting here would report a route as
+    // pinnable when the real calls cannot be pinned.
+    return this.pinReaderWired ? [] : [...DEFAULT_CAPABILITIES]
   }
 
   /** Record one request in the observation store. */
@@ -329,20 +382,45 @@ export class Engine {
    * Harvest the exact channel list for one pipeline by pinning a channel that
    * cannot exist: the router fails before spending a token and names every
    * provider it could have used.
+   *
+   * The impossible pin doubles as the only reliable test of whether this id
+   * honors pins at all. A route that drops `providerOptions` never sees the
+   * bad name, so it answers with an ordinary completion (or with the model's
+   * own "empty response content" refusal once a reasoning model burns the
+   * budget) instead of a routing refusal.
+   *
+   * The planner probe carries the capability gate. On a VMC-fixed id that is
+   * the difference between a useless answer (the private channel serves it and
+   * the impossible `only` is never seen) and a refusal that both proves the pin
+   * reaches the router and lists the provider set a capability can choose from.
+   * `deepseek/deepseek-v4.1-flash` still answers, which is why the verdict — not
+   * the VMC footprint — is what marks a route inert.
    */
   async harvest(
     model: string,
     pipeline: "planner" | "direct",
     account: ResolvedAccount,
-    options: { signal?: AbortSignal; timeoutMs?: number } = {},
-  ): Promise<string[] | null> {
+    options: {
+      signal?: AbortSignal
+      timeoutMs?: number
+      /** Capability conditions sent with the planner probe. */
+      capabilities?: string[]
+    } = {},
+  ): Promise<HarvestResult> {
+    const capabilities = normalizeCapabilities(options.capabilities)
     const base = { model, messages: [{ role: "user", content: "hi" }], max_tokens: 16 }
     const body =
       pipeline === "planner"
-        ? { ...base, providerOptions: { gateway: { only: ["__probe__"] } } }
+        ? {
+            ...base,
+            providerOptions: {
+              gateway: { only: ["__probe__"], ...(capabilities.length === 0 ? {} : { has: capabilities }) },
+            },
+          }
         : { ...base, provider: { only: ["__probe__"] } }
+    let result: Awaited<ReturnType<typeof chatCompletion>>
     try {
-      const result = await chatCompletion(
+      result = await chatCompletion(
         this.chatOptions({
           baseURL: account.baseURL,
           apiKey: account.key,
@@ -351,12 +429,24 @@ export class Engine {
           timeoutMs: options.timeoutMs ?? this.probeTimeoutMs,
         }),
       )
-      const payload = unwrapEnvelope<any>(result.json)
-      const message = errorText(payload?.error) || result.text
-      return extractAvailableProviders(message, pipeline)
     } catch {
-      return null
+      return { channels: null, verdict: "unknown" }
     }
+    const payload = unwrapEnvelope<any>(result.json)
+    const message = errorText(payload?.error) || result.text
+    const channels = extractAvailableProviders(message, pipeline)
+    if (channels !== null) return { channels, verdict: "refused" }
+    // A capability refusal is still a routing refusal: the planner read the pin
+    // and could not satisfy the gate. It proves the pin reaches the router, but
+    // names no pool, so the channel list stays unknown.
+    if (/no_capable_providers_available|satisfy the required has conditions/i.test(message)) {
+      return { channels: null, verdict: "gated" }
+    }
+    // Inference ran: the impossible channel was never routed, so a pin cannot
+    // reach this route's router either.
+    const answered = Array.isArray(payload?.choices) && payload.choices.length > 0
+    const burnedTheBudget = /empty response content/i.test(message)
+    return { channels: null, verdict: answered || burnedTheBudget ? "answered" : "unknown" }
   }
 
   /**
@@ -402,18 +492,44 @@ export class Engine {
     }
     const routing = parseRouting(payload)
     const pipeline = routing.pipeline
+    // A VMC-fixed default route picks one private channel, but that no longer
+    // decides whether a pin works: the capability gate can still reach the
+    // router. Only the gated impossible-pin verdict can tell the two apart, so
+    // the harvest runs even when the VMC looks locked.
+    const vmcDefault = routeLocked(routing)
+    const capabilities = this.capabilityGate(model)
     const otherPipeline = pipeline === "planner" ? "direct" : pipeline === "direct" ? "planner" : null
     let harvested: string[] | null = null
+    let pinDropped = false
+    let gateReached = false
     if (pipeline !== null) {
-      harvested = await this.harvest(model, pipeline, account, { signal: options.signal, timeoutMs: this.probeTimeoutMs })
+      const outcome = await this.harvest(model, pipeline, account, {
+        signal: options.signal,
+        timeoutMs: this.probeTimeoutMs,
+        capabilities: pipeline === "planner" ? capabilities : [],
+      })
+      harvested = outcome.channels
+      pinDropped = outcome.verdict === "answered"
+      gateReached = outcome.verdict === "refused" || outcome.verdict === "gated"
     }
     let otherHarvested: string[] | null = null
     if (otherPipeline !== null) {
-      otherHarvested = await this.harvest(model, otherPipeline, account, {
-        signal: options.signal,
-        timeoutMs: this.probeTimeoutMs,
-      })
+      // Only the detected pipeline's verdict says anything about pinning: the
+      // other spelling is, by definition, not the one this route reads, so its
+      // request is expected to run unpinned and answer.
+      otherHarvested = (
+        await this.harvest(model, otherPipeline, account, {
+          signal: options.signal,
+          timeoutMs: this.probeTimeoutMs,
+        })
+      ).channels
     }
+    // A route that answers even a capability-gated impossible pin proves it
+    // never reads provider options. That is the only real lock.
+    const lockedRoute = pinDropped
+    // The VMC path is the one that needs the gate; recording it lets the UI say
+    // why a pin works instead of repeating the old "VMC = unpinnable" story.
+    const capabilityGated = vmcDefault && gateReached
     let endpoints: Awaited<ReturnType<typeof openRouterEndpoints>>["endpoints"] = []
     let openrouterSlug: string | null = null
     if (pipeline !== "planner" && typeof routing.canonicalSlug === "string") {
@@ -452,7 +568,13 @@ export class Engine {
     const meta = this.store.learn(model, {
       ok: true,
       pipeline,
-      pinnable: pipeline !== null,
+      // "Pinnable" means a pin can actually reach the router. On a planner
+      // route only the capability-gated impossible pin proves it; a VMC by
+      // itself no longer disqualifies, because the gate reaches its router.
+      pinnable: pipeline !== null && !lockedRoute,
+      virtualModel: routing.virtualModel,
+      pinInert: lockedRoute,
+      capabilityGated,
       availableProviders: harvested ?? previous.availableProviders ?? [],
       canonicalSlug: routing.canonicalSlug ?? previous.canonicalSlug ?? null,
       openrouterSlug: openrouterSlug ?? previous.openrouterSlug ?? null,
@@ -473,6 +595,14 @@ export class Engine {
       error: "",
       pipeline: meta.pipeline ?? "",
       pinnable: meta.pinnable === true,
+      virtualModel: meta.virtualModel ?? "",
+      pinInert: meta.pinInert === true,
+      capabilityGated: meta.capabilityGated === true,
+      warning: meta.pinInert !== true
+        ? ""
+        : meta.virtualModel !== null && meta.virtualModel !== undefined && meta.virtualModel !== ""
+          ? `this id routes through VMC ${meta.virtualModel} and answered even a capability-gated impossible pin, so pins cannot reach its router. Pinning needs an id whose provider list the gateway evaluates`
+          : `this id answered an impossible pin instead of refusing it, so the gateway drops the pin before routing: pins cannot apply on it`,
       canonicalSlug: meta.canonicalSlug ?? "",
       lastProvider: meta.lastProvider ?? "",
       upstreams: meta.upstreams ?? [],
@@ -489,6 +619,10 @@ export class Engine {
       error,
       pipeline: "",
       pinnable: false,
+      virtualModel: "",
+      pinInert: false,
+      capabilityGated: false,
+      warning: "",
       canonicalSlug: "",
       lastProvider: "",
       upstreams: [],
@@ -508,6 +642,7 @@ export class Engine {
   async validate(model: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<ValidateOutcome> {
     const meta = this.store.metaOf(model)
     const list = Array.isArray(meta.upstreams) ? meta.upstreams : []
+    const capabilities = this.capabilityGate(model)
     const results: ValidateRow[] = []
     for (let index = 0; index < list.length; index += VALIDATE_CONCURRENCY) {
       if (options.signal?.aborted === true) break
@@ -515,7 +650,16 @@ export class Engine {
       const settled = await Promise.all(
         batch.map(async (upstream): Promise<ValidateRow> => {
           const started = Date.now()
-          const attempt: Attempt = { upstream, strict: true, sort: null, orderRest: [], excludeList: [] }
+          // The gate is part of the request a real pin sends, so a channel that
+          // only looks reachable without it is not actually usable.
+          const attempt: Attempt = {
+            upstream,
+            strict: true,
+            sort: null,
+            orderRest: [],
+            excludeList: [],
+            ...(capabilities.length === 0 ? {} : { capabilities }),
+          }
           const base = { model, messages: [{ role: "user", content: "hi" }], max_tokens: 16 }
           const body = injectPrefs(base, meta, attempt)
           try {
@@ -595,6 +739,9 @@ export class Engine {
     const excluded = pin.exclude ?? []
     const routing = outcome.result?.routing ?? {}
     const account = outcome.result?.account?.name ?? ""
+    const meta = this.store.metaOf(model)
+    const virtualModel = typeof meta.virtualModel === "string" ? meta.virtualModel : ""
+    const pinInert = meta.pinInert === true
     if (!outcome.ok) {
       this.record(model, {
         provider: routing.finalProvider ?? null,
@@ -616,7 +763,9 @@ export class Engine {
         actual: routing.finalProvider ?? "",
         actualName: routing.finalProviderName ?? "",
         pipeline: routing.pipeline ?? "",
-        pinnable: routing.pipeline !== null && routing.pipeline !== undefined,
+        pinnable: routing.pipeline !== null && routing.pipeline !== undefined && !pinInert,
+        virtualModel,
+        pinInert,
         canonicalSlug: routing.canonicalSlug ?? "",
         account,
         content: "",
@@ -647,7 +796,9 @@ export class Engine {
       actual: routing.finalProvider ?? "",
       actualName: routing.finalProviderName ?? "",
       pipeline: routing.pipeline ?? "",
-      pinnable: routing.pipeline !== null && routing.pipeline !== undefined,
+      pinnable: routing.pipeline !== null && routing.pipeline !== undefined && !pinInert,
+      virtualModel,
+      pinInert,
       canonicalSlug: routing.canonicalSlug ?? "",
       account,
       content: String(routing.content ?? "").slice(0, 120),

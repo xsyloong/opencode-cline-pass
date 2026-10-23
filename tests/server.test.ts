@@ -255,6 +255,37 @@ describe("streaming gateway", () => {
     expect(runtime.store.metaOf(MODEL).upstreamStatus?.deepseek?.status).toBe("ok")
   })
 
+  it("records a PIN_DROPPED warning when the router serves a channel it was told not to", async () => {
+    // The pin asks for `deepseek`, the answer says `fireworks`: a 200 with the
+    // wrong channel is the only symptom of a silently ignored pin.
+    const { runtime, gateway } = await boot(
+      async () =>
+        Response.json({
+          choices: [
+            {
+              message: {
+                content: "served elsewhere",
+                provider_metadata: { gateway: { routing: { finalProvider: "fireworks" } } },
+              },
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }),
+      { perModel: { [MODEL]: { upstreams: ["deepseek"], pinMode: "strict", exclude: [], sort: "" } } },
+    )
+    const response = await chat(gateway, {
+      model: MODEL,
+      stream: false,
+      messages: [{ role: "user", content: "hi" }],
+    })
+    expect(response.status).toBe(200)
+    await wait()
+    const entry = runtime.store.readHistory(1)[0]!
+    expect(entry.adherence).toBe("not-adopted")
+    expect(entry.provider).toBe("fireworks")
+    expect((entry.warnings ?? []).join("\n")).toMatch(/PIN_DROPPED.*fireworks/)
+  })
+
   it("surfaces reasoning_details under a field the AI SDK reads", async () => {
     const { gateway } = await boot(async () =>
       sse([
@@ -271,6 +302,49 @@ describe("streaming gateway", () => {
     const text = await response.text()
     expect(text).toContain('"reasoning_content":"thinking"')
     expect(text).toContain('"content":"answer"')
+  })
+})
+
+describe("model aliases", () => {
+  const LOCAL = "cline-pass/deepseek-v4.1-flash-1017-open"
+  const SLUG = "deepseek/deepseek-v4.1-flash-1017"
+
+  it("puts the aliased open-pool slug on the wire and applies its pin", async () => {
+    const bodies: any[] = []
+    const { gateway } = await boot(
+      async (_url, init) => {
+        bodies.push(bodyOf(init))
+        return Response.json({
+          choices: [
+            {
+              message: {
+                content: "aliased ok",
+                provider_metadata: {
+                  gateway: { routing: { finalProvider: "deepinfra", fallbacksAvailable: [] } },
+                },
+              },
+            },
+          ],
+          usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+        })
+      },
+      {
+        knownModels: [LOCAL],
+        modelAliases: { [LOCAL]: SLUG },
+        // The pin is stored under the wire id, which is what the router sees.
+        perModel: { [SLUG]: { upstreams: ["deepinfra"], pinMode: "strict", exclude: [], sort: "" } },
+      },
+    )
+    const response = await chat(gateway, {
+      model: "deepseek-v4.1-flash-1017-open",
+      stream: false,
+      messages: [{ role: "user", content: "hi" }],
+    })
+    expect(response.status).toBe(200)
+    expect(bodies[0].model).toBe(SLUG)
+    expect(bodies[0].providerOptions.gateway.only).toEqual(["deepinfra"])
+    const json: any = await response.json()
+    expect(json.choices[0].message.content).toBe("aliased ok")
   })
 })
 

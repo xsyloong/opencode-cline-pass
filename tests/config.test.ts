@@ -20,13 +20,42 @@ describe("configuration", () => {
     expect(cfg.provider).toBe("cline-pass")
     expect(cfg.baseURL).toBe("https://api.cline.bot/api/v1")
     expect(cfg.accountMode).toBe("single")
-    expect(cfg.knownModels).toHaveLength(15)
+    expect(cfg.knownModels).toHaveLength(19)
+    expect(cfg.modelAliases["cline-pass/deepseek-v4.1-flash-1017-open"]).toBe(
+      "deepseek/deepseek-v4.1-flash-1017",
+    )
+    // One alias per VMC-locked model, and none for the model that pins already.
+    expect(cfg.modelAliases["cline-pass/glm-5.3-open"]).toBe("z-ai/glm-5.3")
+    expect(cfg.modelAliases["cline-pass/kimi-k3-open"]).toBe("moonshotai/kimi-k3")
+    expect(cfg.modelAliases["cline-pass/deepseek-v4-pro-open"]).toBeUndefined()
+    // A model whose slug also drops pins gets no alias at all.
+    expect(cfg.modelAliases["cline-pass/deepseek-v4.1-flash-open"]).toBeUndefined()
     expect(cfg.defaultMaxTokens).toBe(DEFAULT_MAX_TOKENS)
     expect(cfg.maxConcurrentRequests).toBe(DEFAULT_MAX_CONCURRENT_REQUESTS)
     expect(cfg.pinSpelling).toBe("both")
     expect(cfg.exposeTools).toBe(true)
     expect(cfg.skipCatalogScan).toBe(true)
     expect(await config.resolveCredential("CLINE_PASS_API_KEY")).toBeTruthy()
+  })
+
+  it("ships the capability gate and lets one model override it", () => {
+    expect(defaultConfig().pinCapabilities).toEqual(["vision"])
+    expect(normalizeConfig({}).pinCapabilities).toEqual(["vision"])
+
+    expect(normalizeConfig({ pinCapabilities: [" Tool-Use ", "vision", "vision"] }).pinCapabilities).toEqual([
+      "tool-use",
+      "vision",
+    ])
+    // An explicit empty list turns the gate off; that is a real setting, not a
+    // fallback, because on a VMC id it makes pins inert.
+    expect(normalizeConfig({ pinCapabilities: [] }).pinCapabilities).toEqual([])
+
+    const perModel = normalizeConfig({
+      perModel: { "cline-pass/x": { upstreams: ["a"], capabilities: ["implicit-caching"] } },
+    })
+    expect(perModel.perModel["cline-pass/x"]!.capabilities).toEqual(["implicit-caching"])
+    // Unset stays empty so `pinFor` can inherit the route-wide gate.
+    expect(normalizeConfig({ perModel: { "cline-pass/x": { upstreams: ["a"] } } }).perModel["cline-pass/x"]!.capabilities).toEqual([])
   })
 
   it("persists a patch and reloads it", async () => {
@@ -134,7 +163,7 @@ describe("configuration", () => {
 
   it("exposes the defaults the tools advertise", () => {
     expect(defaultConfig().exposeTools).toBe(true)
-    expect(defaultConfig().knownModels).toHaveLength(15)
+    expect(defaultConfig().knownModels).toHaveLength(19)
   })
 
   it("merges account dictionaries instead of replacing them", async () => {
@@ -169,7 +198,7 @@ describe("configuration", () => {
     const env = testEnv(directory)
     const first = await ConfigStore.load({ directory, env })
     const second = await ConfigStore.load({ directory, env })
-    const pin = { upstreams: ["alibaba"], exclude: ["deepseek"], pinMode: "preferred", sort: "ttft" }
+    const pin = { upstreams: ["alibaba"], exclude: ["deepseek"], pinMode: "preferred", sort: "ttft", capabilities: [] }
     await first.update({ perModel: { "cline-pass/glm-5.2": pin } })
     // `second` loaded before the pin. Its stale snapshot must not erase it when
     // it refreshes the catalog.
@@ -183,7 +212,7 @@ describe("configuration", () => {
     const env = testEnv(directory)
     const first = await ConfigStore.load({ directory, env })
     const second = await ConfigStore.load({ directory, env })
-    const pin = { upstreams: ["fireworks"], exclude: [], pinMode: "preferred", sort: "ttft" }
+    const pin = { upstreams: ["fireworks"], exclude: [], pinMode: "preferred", sort: "ttft", capabilities: [] }
     await first.update({ perModel: { "cline-pass/glm-5.2": pin } })
     await new Promise((resolve) => setTimeout(resolve, 10))
     expect(second.read().perModel["cline-pass/glm-5.2"]).toEqual(pin)

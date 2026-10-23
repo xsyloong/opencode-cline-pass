@@ -6,12 +6,11 @@
  * credentials are reported as a masked hint, never as a value.
  */
 import { accountProfileFor, maskKey } from "./accounts.js"
-import { wireModelId } from "./catalog.js"
 import type { Control } from "./control.js"
 import type { Engine } from "./engine.js"
 import { fetchDailyUsage, fetchProfile, fetchUsageLimits } from "./gateway.js"
 import type { Logger } from "./log.js"
-import { BUILD_TAG, normalizePinMode } from "./protocol.js"
+import { BUILD_TAG, normalizeCapabilities, normalizePinMode } from "./protocol.js"
 import type { ObservationStore } from "./store.js"
 import type { HistoryEntry, ModelMeta, PinProfile, UsageReading } from "./types.js"
 
@@ -25,12 +24,22 @@ export function firstLine(value: unknown, max = 200): string {
 
 export interface ProjectedModel {
   id: string
+  /** The id actually put on the wire; differs from `id` when an alias applies. */
+  wire: string
   displayName: string
   pipeline: string
   pinnable: boolean
+  /** The VMC that fixed this route, when the gateway used one. */
+  virtualModel: string
+  /** True when the route answered an impossible pin: every pin is dropped. */
+  pinInert: boolean
+  /** True when the VMC honors pins only through the `has` capability gate. */
+  capabilityGated: boolean
   hidden: boolean
   pinMode: string
   sort: string
+  /** Capability gate sent with this model's planner pins. */
+  capabilities: string[]
   pinned: string[]
   excluded: string[]
   upstreams: string[]
@@ -47,6 +56,7 @@ export function projectModel(
   pin: Partial<PinProfile> | undefined,
   meta: ModelMeta | undefined,
   hidden = false,
+  wire = model,
 ): ProjectedModel {
   const upstreamStatus = Object.entries(meta?.upstreamStatus ?? {}).map(([upstream, verdict]) => ({
     upstream: String(upstream),
@@ -57,14 +67,19 @@ export function projectModel(
   }))
   return {
     id: String(model),
+    wire: String(wire),
     displayName: String(model).replace(/^cline-pass\//, ""),
     pipeline: String(meta?.pipeline ?? ""),
     pinnable: meta?.pinnable === true,
+    virtualModel: String(meta?.virtualModel ?? ""),
+    pinInert: meta?.pinInert === true,
+    capabilityGated: meta?.capabilityGated === true,
     hidden: hidden === true,
     // The executed mode, not a second opinion about it: `buildAttempts` reads
     // the same normalizer, so what this shows is what a request will do.
     pinMode: normalizePinMode(pin?.pinMode),
     sort: String(pin?.sort ?? ""),
+    capabilities: Array.isArray(pin?.capabilities) ? pin.capabilities.map(String) : [],
     pinned: Array.isArray(pin?.upstreams) ? pin.upstreams.map(String) : [],
     excluded: Array.isArray(pin?.exclude) ? pin.exclude.map(String) : [],
     upstreams: Array.isArray(meta?.upstreams) ? meta.upstreams.map(String) : [],
@@ -99,9 +114,21 @@ export function createDashboardApi(options: DashboardOptions): Record<string, Da
 
   /** The model id a payload names, or a helpful refusal. */
   const modelOf = (payload: any): string => {
-    const model = wireModelId(String(payload?.model ?? ""))
-    if (model.length === 0) throw new Error("this action needs a `model` id")
-    return model
+    const raw = String(payload?.model ?? "").trim()
+    if (raw.length === 0) throw new Error("this action needs a `model` id")
+    return control.wireModel(raw)
+  }
+
+  /** The configured (local) id a payload names, resolved through its alias. */
+  const localModelOf = (payload: any): { local: string; wire: string } => {
+    const raw = String(payload?.model ?? "").trim()
+    if (raw.length === 0) throw new Error("this action needs a `model` id")
+    const known = (readConfig().knownModels ?? []).map(String)
+    const local = known.find((id) => id === raw || control.wireModel(id) === control.wireModel(raw))
+    if (local === undefined) {
+      throw new Error(`${JSON.stringify(raw)} is not one of this route's subscription models`)
+    }
+    return { local, wire: control.wireModel(local) }
   }
 
   /** One account as the dashboard shows it: never the key itself. */
@@ -119,9 +146,12 @@ export function createDashboardApi(options: DashboardOptions): Record<string, Da
     const cfg = readConfig()
     const accounts = await accountView()
     const hidden = new Set((cfg.hiddenModels ?? []).map(String))
-    const models = (cfg.knownModels ?? []).map((id) =>
-      projectModel(id, cfg.perModel?.[id] ?? {}, store.metaOf(id), hidden.has(String(id))),
-    )
+    const models = (cfg.knownModels ?? []).map((id) => {
+      const wire = control.wireModel(String(id))
+      // The effective pin, so the panel shows the gate that will actually be
+      // sent (a route-wide `pinCapabilities` applies to every model).
+      return projectModel(id, control.pinFor(id), store.metaOf(wire), hidden.has(String(id)), wire)
+    })
     const effectiveAccount = await control.effectiveAccount()
     const usable = effectiveAccount !== "" && accounts.some((account) => account.keyConfigured && account.enabled)
     return {
@@ -225,11 +255,8 @@ export function createDashboardApi(options: DashboardOptions): Record<string, Da
 
   /** Show or hide one model in every picker this route feeds. */
   async function modelVisibility(payload: any): Promise<Record<string, unknown>> {
-    const model = modelOf(payload)
+    const { local: model } = localModelOf(payload)
     const cfg = readConfig()
-    if (!(cfg.knownModels ?? []).map(String).includes(model)) {
-      throw new Error(`${JSON.stringify(model)} is not one of this route's subscription models`)
-    }
     const hidden = new Set((cfg.hiddenModels ?? []).map(String))
     if (payload?.visible === false) hidden.add(model)
     else hidden.delete(model)
@@ -282,7 +309,7 @@ export function createDashboardApi(options: DashboardOptions): Record<string, Da
       key = await control.readCredential(ref)
       if (key === "") throw new Error(`no key is stored at ${ref}`)
     }
-    const model = (cfg.knownModels ?? [])[0] ?? "cline-pass/glm-5.3-flash"
+    const model = control.wireModel((cfg.knownModels ?? [])[0] ?? "cline-pass/glm-5.3-flash")
     const result = await engine.testAccount({ key, baseURL, model })
     return {
       ok: result.authorized === true,
@@ -366,7 +393,13 @@ export function createDashboardApi(options: DashboardOptions): Record<string, Da
   async function modelPin(payload: any): Promise<Record<string, unknown>> {
     const model = modelOf(payload)
     const cfg = readConfig()
-    const current = cfg.perModel?.[model] ?? { upstreams: [], exclude: [], pinMode: "strict", sort: "" }
+    const current = cfg.perModel?.[model] ?? {
+      upstreams: [],
+      exclude: [],
+      pinMode: "strict",
+      sort: "",
+      capabilities: [],
+    }
     const next: PinProfile = {
       upstreams: Array.isArray(payload?.upstreams)
         ? payload.upstreams.map(String).filter((value: string) => value.length > 0)
@@ -386,6 +419,12 @@ export function createDashboardApi(options: DashboardOptions): Record<string, Da
           : payload.sort === "none" || payload.sort === ""
             ? ""
             : String(payload.sort),
+      // Omitted keeps the stored value; an empty array deliberately disables the
+      // gate, which is the one way to make a VMC pin inert on purpose.
+      capabilities:
+        payload?.capabilities === undefined
+          ? (current.capabilities ?? []).map(String)
+          : normalizeCapabilities(payload.capabilities),
     }
     await control.updateConfig({ perModel: { ...(cfg.perModel ?? {}), [model]: next } })
     return { model, pin: next, ...(await state()) }
@@ -453,7 +492,12 @@ export function createDashboardApi(options: DashboardOptions): Record<string, Da
   /** Rescan the official subscription list and adopt newly published models. */
   async function modelsRefresh(): Promise<Record<string, unknown>> {
     const scan = await control.refreshCatalog()
-    return { added: scan.added.map(String), sources: (scan.sources ?? []).map(String), ...(await state()) }
+    return {
+      added: scan.added.map(String),
+      aliases: (scan.aliases ?? []).map(String),
+      sources: (scan.sources ?? []).map(String),
+      ...(await state()),
+    }
   }
 
   /** Drop one model's pin and return it to automatic routing. */

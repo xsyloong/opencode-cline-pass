@@ -45,6 +45,39 @@ export const MODEL_CATALOG: Record<string, ModelCatalogEntry> = {
     reasoning: true,
     input: ["text"],
   },
+  // Open-pool aliases. The `cline-pass/*` ids resolve to a VMC that hardcodes
+  // one provider and ignores every pin; the same weights stay pinnable through
+  // the vendor slug. The name says "billed" on purpose: that route is charged
+  // per token at list price, which measured ~30x the subscription rate, so the
+  // cost has to be visible at the moment someone picks the model.
+  "cline-pass/deepseek-v4.1-flash-1017-open": {
+    name: "DeepSeek V4.1 Flash 1017 (open pool · billed)",
+    contextWindow: 1000000,
+    maxTokens: 384000,
+    reasoning: true,
+    input: ["text"],
+  },
+  "cline-pass/glm-5.3-open": {
+    name: "GLM-5.3 (open pool · billed)",
+    contextWindow: 1000000,
+    maxTokens: 131072,
+    reasoning: true,
+    input: ["text"],
+  },
+  "cline-pass/kimi-k3-open": {
+    name: "Kimi K3 (open pool · billed)",
+    contextWindow: 1048576,
+    maxTokens: 131072,
+    reasoning: true,
+    input: ["text", "image"],
+  },
+  "cline-pass/qwen3.8-max-open": {
+    name: "Qwen3.8 Max (open pool · billed)",
+    contextWindow: 1000000,
+    maxTokens: 131072,
+    reasoning: true,
+    input: ["text", "image"],
+  },
   "cline-pass/glm-5.3": {
     name: "GLM-5.3",
     contextWindow: 1000000,
@@ -133,17 +166,33 @@ export const MODEL_CATALOG: Record<string, ModelCatalogEntry> = {
 
 /** Published entry for one model id, or undefined when the catalog lacks it. */
 export function catalogEntry(model: string): ModelCatalogEntry | undefined {
-  const exact = MODEL_CATALOG[model]
-  if (exact !== undefined) return exact
+  const key = String(model)
+  const direct = MODEL_CATALOG[key]
+  if (direct !== undefined) return direct
+  // The shipped table is keyed by the subscription id (`cline-pass/x`), while a
+  // caller may address the same model by its open-pool slug (`vendor/x`). Try
+  // the prefixed form, then the bare tail of the slug, before giving up.
+  const tail = key.includes("/") ? key.slice(key.lastIndexOf("/") + 1) : key
+  const candidates = [
+    key.startsWith(MODEL_PREFIX) ? key : `${MODEL_PREFIX}${key}`,
+    tail === key ? key : `${MODEL_PREFIX}${tail}`,
+  ]
+  for (const candidate of candidates) {
+    const known = MODEL_CATALOG[candidate]
+    if (known !== undefined) return known
+  }
   // Dated snapshots (for example deepseek-v4.1-flash-1017) carry the same
   // context/output/modality facts as their base model. Falling back to the
   // generic 128k default here made opencode compact long sessions far too
   // early, which looks like the model "losing context".
-  const dated = /^(.+)-(\d{4,})$/.exec(model)
-  if (dated === null) return undefined
-  const base = MODEL_CATALOG[dated[1]!]
-  if (base === undefined) return undefined
-  return { ...base, name: `${base.name} (${dated[2]})` }
+  for (const candidate of [key, ...candidates]) {
+    const dated = /^(.+)-(\d{4,})$/.exec(candidate)
+    if (dated === null) continue
+    const base = MODEL_CATALOG[dated[1]!]
+    if (base === undefined) continue
+    return { ...base, name: `${base.name} (${dated[2]})` }
+  }
+  return undefined
 }
 
 /**
@@ -244,15 +293,22 @@ export function discoveredContext(meta: ModelMeta | undefined): number | undefin
 }
 
 /**
- * The opencode provider model entry for one resolved model.
+ * The provider model entry for one resolved model.
  *
- * Modalities and output limit are what opencode uses to decide whether to send
- * images and how much completion room to reserve. `reasoning_options` makes
- * opencode build one variant per effort, and each variant becomes a
- * `reasoning_effort` field on the wire.
+ * Modalities and output limit are what the host uses to decide whether to send
+ * images and how much completion room to reserve. `reasoning_options` makes it
+ * build one variant per effort, and each variant becomes a `reasoning_effort`
+ * field on the wire.
+ *
+ * The window is written twice on purpose. opencode reads `limit.context`, while
+ * the pi-ai layer underneath dsh reads a top-level `contextWindow` and ignores
+ * `limit` entirely. Publishing only the nested form left dsh resolving every
+ * model to its route-wide `defaultContextWindow` — a 1M-window model advertised
+ * as 128k, which compacts a session long before the model is actually full.
  */
 export function toOpencodeModelConfig(resolved: ResolvedModel): Record<string, unknown> {
   const reasoning = resolved.reasoning === true
+  const output = resolved.defaultMaxTokens ?? 64000
   return {
     name: resolved.name,
     attachment: resolved.inputModalities.includes("image"),
@@ -261,8 +317,11 @@ export function toOpencodeModelConfig(resolved: ResolvedModel): Record<string, u
     temperature: true,
     limit: {
       context: resolved.context.contextWindow,
-      output: resolved.defaultMaxTokens ?? 64000,
+      output,
     },
+    // pi-ai (dsh) reads these; opencode ignores them.
+    contextWindow: resolved.context.contextWindow,
+    maxTokens: output,
     modalities: {
       input: resolved.inputModalities,
       output: ["text"],
@@ -291,9 +350,26 @@ export function providerModelKey(id: string): string {
   return value.startsWith(MODEL_PREFIX) ? value.slice(MODEL_PREFIX.length) : value
 }
 
-/** The upstream wire model id for a model key opencode sent. */
-export function wireModelId(id: string): string {
+/**
+ * The upstream wire model id for a model key opencode sent.
+ *
+ * An alias wins over the plain prefix rule: it is the only way to address a
+ * model the subscription publishes when that id now resolves to a VMC, because
+ * the alias names the open-pool slug the gateway still routes freely.
+ */
+export function wireModelId(id: string, aliases: Record<string, string> = {}): string {
   const value = String(id).trim()
   if (value.length === 0) return value
-  return value.includes("/") ? value : `${MODEL_PREFIX}${value}`
+  const direct = aliases[value]
+  if (typeof direct === "string" && direct.length > 0) return direct
+  const wire = value.includes("/") ? value : `${MODEL_PREFIX}${value}`
+  const aliased = aliases[wire]
+  if (typeof aliased === "string" && aliased.length > 0) return aliased
+  return wire
+}
+
+/** Whether an id already names a concrete model rather than a subscription key. */
+export function isSlugModelId(id: string): boolean {
+  const value = String(id).trim()
+  return value.includes("/") && !value.startsWith(MODEL_PREFIX)
 }

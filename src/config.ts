@@ -17,6 +17,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { ClinePassError } from "./errors.js"
+import { DEFAULT_CAPABILITIES, normalizeCapabilities } from "./protocol.js"
 import { DEFAULT_HISTORY_LIMIT } from "./store.js"
 import type { AccountProfile, ModelProfile, PinProfile, PluginConfig } from "./types.js"
 
@@ -37,7 +38,34 @@ export const DEFAULT_MODELS = [
   "cline-pass/qwen3.7-plus",
   "cline-pass/kimi-k2.7-code",
   "cline-pass/qwen3.7-max",
+  // Open-pool aliases: the vendor slug is billed per token instead of at the
+  // subscription rate. The gate makes the `cline-pass/*` form pinnable too, so
+  // these are for reaching the open pool's channel list, not for pinning.
+  "cline-pass/deepseek-v4.1-flash-1017-open",
+  "cline-pass/glm-5.3-open",
+  "cline-pass/kimi-k3-open",
+  "cline-pass/qwen3.8-max-open",
 ]
+
+/**
+ * Shipped local-id → wire-id aliases.
+ *
+ * These point at the open pool, which is billed per token rather than at the
+ * subscription rate. They are not the way to pin a VMC id any more: a
+ * capability-gated `only` (`has` + `only`) reaches the router on the
+ * subscription route. They remain useful when the open pool's own channel list
+ * or per-channel pricing is what you want.
+ *
+ * An alias is only shipped when the target is verified to refuse an impossible
+ * `only`. `deepseek/deepseek-v4.1-flash` does not (it answers one), so that
+ * model gets no alias: pointing it at a slug would promise a pin it cannot keep.
+ */
+export const DEFAULT_MODEL_ALIASES: Record<string, string> = {
+  "cline-pass/deepseek-v4.1-flash-1017-open": "deepseek/deepseek-v4.1-flash-1017",
+  "cline-pass/glm-5.3-open": "z-ai/glm-5.3",
+  "cline-pass/kimi-k3-open": "moonshotai/kimi-k3",
+  "cline-pass/qwen3.8-max-open": "qwen/qwen3.8-max",
+}
 
 export const DEFAULT_PROVIDER = "cline-pass"
 export const DEFAULT_SETTINGS_NS = "cline-pass"
@@ -62,6 +90,7 @@ export function defaultConfig(): PluginConfig {
     activeAccount: "",
     knownModels: [...DEFAULT_MODELS],
     hiddenModels: [],
+    modelAliases: { ...DEFAULT_MODEL_ALIASES },
     models: {},
     perModel: {},
     reasoningModels: true,
@@ -76,6 +105,10 @@ export function defaultConfig(): PluginConfig {
     skipCatalogScan: false,
     historyLimit: DEFAULT_HISTORY_LIMIT,
     pinSpelling: "both",
+    // The gate that makes a planner allow-list reach the router on VMC ids.
+    // `vision` holds for every current coding model; a text-only model wants
+    // `tool-use` instead, set per install or per model.
+    pinCapabilities: [...DEFAULT_CAPABILITIES],
     serverHost: "127.0.0.1",
     serverPort: 0,
     dashboard: true,
@@ -150,7 +183,22 @@ function normalizePin(raw: unknown): PinProfile {
     exclude: Array.isArray(value.exclude) ? value.exclude.map(String) : [],
     pinMode: value.pinMode === "preferred" ? "preferred" : "strict",
     sort: typeof value.sort === "string" ? value.sort : "",
+    // Empty means "inherit pinCapabilities"; a per-model list overrides it.
+    capabilities: normalizeCapabilities(value.capabilities),
   }
+}
+
+/** Keep only well-formed `local id -> wire id` pairs. */
+function normalizeAliases(raw: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    const local = String(key ?? "").trim()
+    const wire = typeof value === "string" ? value.trim() : ""
+    if (local.length === 0 || UNSAFE_KEYS.has(local)) continue
+    if (wire.length === 0 || wire === local) continue
+    out[local] = wire
+  }
+  return out
 }
 
 function positive(value: unknown, fallback: number, allowZero = false): number {
@@ -189,6 +237,13 @@ export function normalizeConfig(raw: unknown): PluginConfig {
   const known = Array.isArray(value.knownModels)
     ? value.knownModels.map(String).filter((id) => id.length > 0 && !UNSAFE_KEYS.has(id))
     : defaults.knownModels
+  // Shipped aliases are additive: an existing config that already lists some
+  // must still receive the ones a later build adds, otherwise upgrading could
+  // never repair a VMC-locked model without hand-editing the file. Configured
+  // pairs win on conflict; dropping one is done through `hiddenModels`.
+  const aliases: Record<string, string> = isRecord(value.modelAliases)
+    ? { ...defaults.modelAliases, ...normalizeAliases(value.modelAliases) }
+    : { ...defaults.modelAliases }
   const baseURL = String(value.baseURL ?? defaults.baseURL).trim().replace(/\/+$/, "") || defaults.baseURL
   return {
     provider: String(value.provider ?? "").trim() || defaults.provider,
@@ -200,6 +255,7 @@ export function normalizeConfig(raw: unknown): PluginConfig {
     activeAccount: String(value.activeAccount ?? ""),
     knownModels: known.length > 0 ? [...new Set(known)] : defaults.knownModels,
     hiddenModels: Array.isArray(value.hiddenModels) ? [...new Set(value.hiddenModels.map(String))] : [],
+    modelAliases: aliases,
     models,
     perModel,
     reasoningModels: value.reasoningModels !== false,
@@ -213,6 +269,9 @@ export function normalizeConfig(raw: unknown): PluginConfig {
     skipCatalogScan: value.skipCatalogScan === true,
     historyLimit: positive(value.historyLimit, defaults.historyLimit),
     pinSpelling: value.pinSpelling === "detected" ? "detected" : "both",
+    // A deliberately empty list is meaningful: it turns the capability gate
+    // off. Only a non-array falls back to the shipped default.
+    pinCapabilities: normalizeCapabilities(value.pinCapabilities, defaults.pinCapabilities),
     serverHost: String(value.serverHost ?? defaults.serverHost).trim() || defaults.serverHost,
     serverPort: Math.min(65535, positive(value.serverPort, defaults.serverPort, true)),
     dashboard: value.dashboard !== false,
